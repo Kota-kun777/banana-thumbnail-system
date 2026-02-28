@@ -69,7 +69,7 @@ def get_api_key():
 if "api_key" not in st.session_state:
     st.session_state.api_key = get_api_key()
 
-# ギャラリー蓄積用（ボタンを押すたびに5枚ずつ追加、最大20枚）
+# ギャラリー蓄積用（ボタンを押すたびに5枚ずつ追加、最大50枚）
 if "gallery_images" not in st.session_state:
     st.session_state.gallery_images = []  # 現在のギャラリーの画像パスリスト
 
@@ -135,6 +135,16 @@ def show_gallery(images, gallery_key):
             caption=valid_images[idx].name,
             use_container_width=True,
         )
+        # --- ダウンロードボタン ---
+        with open(valid_images[idx], "rb") as img_file:
+            st.download_button(
+                label=f"📥 この画像をダウンロード（{valid_images[idx].name}）",
+                data=img_file,
+                file_name=valid_images[idx].name,
+                mime="image/png",
+                key=f"dl_{gallery_key}_{idx}",
+                use_container_width=True,
+            )
 
     # --- サムネイルストリップ（1行5枚、現在選択中にマーク表示） ---
     if total > 1:
@@ -186,7 +196,7 @@ with st.sidebar:
     # ギャラリー状況の表示
     st.markdown("---")
     gallery_count = len(st.session_state.gallery_images)
-    st.markdown(f"**📊 現在のギャラリー: {gallery_count} / 20 枚**")
+    st.markdown(f"**📊 現在のギャラリー: {gallery_count} / 50 枚**")
     if gallery_count > 0:
         if st.button("🔄 ギャラリーをリセット（新しく始める）", use_container_width=True):
             st.session_state.gallery_images = []
@@ -231,11 +241,11 @@ if st.session_state.past_prompts:
 
 # ボタンラベルの決定
 gallery_count = len(st.session_state.gallery_images)
-remaining = 20 - gallery_count
+remaining = 50 - gallery_count
 is_max = remaining <= 0
 
 if is_max:
-    btn_label = "🚫 最大20枚に達しました（リセットしてください）"
+    btn_label = "🚫 最大50枚に達しました（リセットしてください）"
 elif gallery_count == 0:
     btn_label = "✨ 画像を生成する（5枚）"
 else:
@@ -265,7 +275,7 @@ if submit_button and prompt and not is_max:
     client = genai.Client(api_key=st.session_state.api_key)
 
     # 今回生成する枚数（常に5枚、ただし上限20枚を超えない）
-    num_to_generate = min(5, 20 - len(st.session_state.gallery_images))
+    num_to_generate = min(5, 50 - len(st.session_state.gallery_images))
 
     # 生成処理
     with st.spinner(f"5枚追加生成中... もうしばらくお待ちください！"):
