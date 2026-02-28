@@ -1,0 +1,33 @@
+# 生成された画像（大量・大容量）
+replica_output/
+
+# ローカル起動スクリプト（APIキーがハードコードされている）
+*.bat
+
+# ローカルのシークレットファイル
+.streamlit/secrets.toml
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# レガシーフォルダ（旧バージョン）
+banana_thumbnails/
+banana_thumbnails_v*/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Misc
+nul
