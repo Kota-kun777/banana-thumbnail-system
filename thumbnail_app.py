@@ -246,7 +246,7 @@ with st.form(key="prompt_form"):
     prompt = st.text_area(
         "プロンプトまたは修正指示を入力してください... (例: オフィス背景で明るく)",
         key="current_prompt",
-        height=100,
+        height=300,
     )
     submit_button = st.form_submit_button(
         label=btn_label,
