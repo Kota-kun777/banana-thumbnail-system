@@ -93,6 +93,13 @@ def save_prompt(new_prompt):
 output_dir = Path(__file__).parent / "replica_output"
 output_dir.mkdir(exist_ok=True, parents=True)
 
+# プロンプト入力用のセッション状態を初期化
+if "current_prompt" not in st.session_state:
+    st.session_state.current_prompt = ""
+
+def set_prompt(text):
+    st.session_state.current_prompt = text
+
 
 # ==============================================================
 # ギャラリー表示コンポーネント（◀ ▶ で画像を切り替え＋サムネ一覧）
@@ -237,13 +244,6 @@ for msg_idx, message in enumerate(st.session_state.chat_history):
 
 
 # ==== 入力エリア：プロンプト送信と画像生成 ====
-
-# プロンプト入力用のセッション状態を初期化
-if "current_prompt" not in st.session_state:
-    st.session_state.current_prompt = ""
-
-def set_prompt(text):
-    st.session_state.current_prompt = text
 
 st.markdown("---")
 # 過去のプロンプトをワンクリックで入力欄にセット
