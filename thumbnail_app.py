@@ -85,7 +85,7 @@ if "past_prompts" not in st.session_state:
 def save_prompt(new_prompt):
     if new_prompt and new_prompt not in st.session_state.past_prompts:
         st.session_state.past_prompts.insert(0, new_prompt)
-        st.session_state.past_prompts = st.session_state.past_prompts[:20]
+        st.session_state.past_prompts = st.session_state.past_prompts[:50]
         with open(past_prompts_file, "w", encoding="utf-8") as f:
             json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
 
@@ -97,8 +97,9 @@ output_dir.mkdir(exist_ok=True, parents=True)
 # ==============================================================
 # ギャラリー表示コンポーネント（◀ ▶ で画像を切り替え＋サムネ一覧）
 # ==============================================================
+@st.fragment
 def show_gallery(images, gallery_key):
-    """◀ ▶ ボタンで大きな画像を切り替えて比較できるギャラリー"""
+    """◀ ▶ ボタンで大きな画像を切り替えて比較できるギャラリー（fragmentで独立rerun）"""
     valid_images = [p for p in images if p.exists()]
     if not valid_images:
         return
@@ -115,7 +116,7 @@ def show_gallery(images, gallery_key):
     with nav_left:
         if st.button("◀ 前へ", key=f"prev_{gallery_key}", use_container_width=True, disabled=(total <= 1)):
             st.session_state[idx_key] = (idx - 1) % total
-            st.rerun()
+            st.rerun(scope="fragment")
     with nav_center:
         st.markdown(
             f"<p style='text-align:center; font-size:1.3rem; font-weight:bold; margin:0.3rem 0;'>"
@@ -125,7 +126,7 @@ def show_gallery(images, gallery_key):
     with nav_right:
         if st.button("次へ ▶", key=f"next_{gallery_key}", use_container_width=True, disabled=(total <= 1)):
             st.session_state[idx_key] = (idx + 1) % total
-            st.rerun()
+            st.rerun(scope="fragment")
 
     # --- メイン画像（大きく表示） ---
     _, center_col, _ = st.columns([1, 6, 1])
@@ -193,6 +194,21 @@ with st.sidebar:
         for file in uploaded_files:
             st.image(file, caption=file.name, use_container_width=True)
 
+    # 過去のプロンプト履歴（7件目以降をサイドバーに表示）
+    if len(st.session_state.past_prompts) > 6:
+        st.markdown("---")
+        st.header("📝 プロンプト履歴")
+        for idx, past_prompt in enumerate(st.session_state.past_prompts[6:]):
+            btn_label = past_prompt if len(past_prompt) <= 30 else past_prompt[:30] + "..."
+            st.button(
+                btn_label,
+                key=f"sidebar_past_{idx}",
+                help=past_prompt,
+                on_click=set_prompt,
+                args=(past_prompt,),
+                use_container_width=True,
+            )
+
     # ギャラリー状況の表示
     st.markdown("---")
     gallery_count = len(st.session_state.gallery_images)
@@ -239,17 +255,37 @@ if st.session_state.past_prompts:
             btn_label = past_prompt if len(past_prompt) <= 18 else past_prompt[:18] + "..."
             st.button(btn_label, key=f"past_btn_{idx}", help=past_prompt, on_click=set_prompt, args=(past_prompt,), use_container_width=True)
 
-# ボタンラベルの決定
+# 生成枚数の選択
+if "gen_count" not in st.session_state:
+    st.session_state.gen_count = 5
+
 gallery_count = len(st.session_state.gallery_images)
 remaining = 50 - gallery_count
 is_max = remaining <= 0
 
+st.markdown("**🔢 生成枚数:**")
+count_cols = st.columns(4)
+for i, count in enumerate([3, 5, 10, 20]):
+    with count_cols[i]:
+        selected = st.session_state.gen_count == count
+        if st.button(
+            f"{'✅ ' if selected else ''}{count}枚",
+            key=f"count_{count}",
+            use_container_width=True,
+            type="primary" if selected else "secondary",
+        ):
+            st.session_state.gen_count = count
+            st.rerun()
+
+chosen_count = st.session_state.gen_count
+
 if is_max:
     btn_label = "🚫 最大50枚に達しました（リセットしてください）"
 elif gallery_count == 0:
-    btn_label = "✨ 画像を生成する（5枚）"
+    btn_label = f"✨ 画像を生成する（{chosen_count}枚）"
 else:
-    btn_label = f"✨ さらに5枚追加生成する（現在 {gallery_count} 枚 → {gallery_count + 5} 枚）"
+    target = min(gallery_count + chosen_count, 50)
+    btn_label = f"✨ さらに{chosen_count}枚追加生成する（現在 {gallery_count} 枚 → {target} 枚）"
 
 # 入力フォーム
 with st.form(key="prompt_form"):
@@ -274,11 +310,11 @@ if submit_button and prompt and not is_max:
 
     client = genai.Client(api_key=st.session_state.api_key)
 
-    # 今回生成する枚数（常に5枚、ただし上限20枚を超えない）
-    num_to_generate = min(5, 50 - len(st.session_state.gallery_images))
+    # 今回生成する枚数（選択した枚数、ただし上限50枚を超えない）
+    num_to_generate = min(st.session_state.gen_count, 50 - len(st.session_state.gallery_images))
 
     # 生成処理
-    with st.spinner(f"5枚追加生成中... もうしばらくお待ちください！"):
+    with st.spinner(f"{num_to_generate}枚追加生成中... もうしばらくお待ちください！"):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # APIへの送信コンテンツ構築
