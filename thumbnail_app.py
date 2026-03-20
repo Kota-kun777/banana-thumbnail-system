@@ -359,6 +359,18 @@ if submit_button and prompt and not is_max:
 
     client = genai.Client(api_key=st.session_state.api_key)
 
+    # 利用可能なモデル一覧を取得してデバッグ表示
+    try:
+        available_models = []
+        for m in client.models.list():
+            model_name = m.name if hasattr(m, 'name') else str(m)
+            if 'image' in model_name.lower() or 'flash' in model_name.lower() or 'pro' in model_name.lower():
+                available_models.append(model_name)
+        if available_models:
+            st.info(f"🔍 利用可能な画像関連モデル: {', '.join(available_models[:15])}")
+    except Exception as e:
+        st.warning(f"モデル一覧取得エラー: {e}")
+
     # 今回生成する枚数（選択した枚数、ただし上限50枚を超えない）
     num_to_generate = min(st.session_state.gen_count, 50 - len(st.session_state.gallery_images))
 
@@ -412,9 +424,21 @@ if submit_button and prompt and not is_max:
                     ),
                 )
 
-                # レスポンスの検証
+                # レスポンスの検証（詳細なデバッグ情報）
                 if not response.candidates:
-                    errors.append(f"画像 {img_num}: APIからの応答にcandidatesがありません")
+                    debug_info = f"画像 {img_num}: candidatesなし"
+                    # ブロック理由を確認
+                    if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                        debug_info += f" | prompt_feedback: {response.prompt_feedback}"
+                    if hasattr(response, 'filters') and response.filters:
+                        debug_info += f" | filters: {response.filters}"
+                    # レスポンス全体の情報
+                    debug_info += f" | response型: {type(response).__name__}"
+                    try:
+                        debug_info += f" | response属性: {[a for a in dir(response) if not a.startswith('_')]}"
+                    except:
+                        pass
+                    errors.append(debug_info)
                     progress_bar.progress((i + 1) / num_to_generate)
                     continue
 
