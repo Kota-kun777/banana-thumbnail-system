@@ -363,10 +363,12 @@ if submit_button and prompt and not is_max:
                 contents.append(image_part)
 
         success = 0
+        errors = []  # エラーを蓄積して最後にまとめて表示
 
         # プログレスバーとステータス
         progress_bar = st.progress(0)
         status_text = st.empty()
+        error_container = st.container()
 
         # 通し番号は既存の枚数 + 1 から開始
         start_num = len(st.session_state.gallery_images) + 1
@@ -380,29 +382,57 @@ if submit_button and prompt and not is_max:
 
             try:
                 response = client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
+                    model="nanobanana-pro",
                     contents=contents,
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE", "TEXT"],
                     ),
                 )
 
+                # レスポンスの検証
+                if not response.candidates:
+                    errors.append(f"画像 {img_num}: APIからの応答にcandidatesがありません")
+                    progress_bar.progress((i + 1) / num_to_generate)
+                    continue
+
+                # 画像データを探す
+                image_found = False
+                text_response = ""
                 for part in response.candidates[0].content.parts:
                     if part.inline_data is not None:
                         with open(filepath, "wb") as f:
                             f.write(part.inline_data.data)
-                        # ギャラリーに追加（蓄積）
                         st.session_state.gallery_images.append(filepath)
                         success += 1
+                        image_found = True
                         break
+                    elif part.text:
+                        text_response = part.text
+
+                if not image_found:
+                    err_detail = f"画像 {img_num}: 画像データなし"
+                    if text_response:
+                        err_detail += f"（API応答: {text_response[:100]}）"
+                    errors.append(err_detail)
 
             except Exception as e:
-                status_text.text(f"⚠️ 画像 {img_num} でエラー: {str(e)[:80]}")
+                errors.append(f"画像 {img_num}: {str(e)[:150]}")
 
             progress_bar.progress((i + 1) / num_to_generate)
 
+        # 結果表示
         total_count = len(st.session_state.gallery_images)
-        status_text.text(f"✅ {success} 枚追加完了！ ギャラリー合計: {total_count} 枚")
+        if success > 0:
+            status_text.text(f"✅ {success} 枚追加完了！ ギャラリー合計: {total_count} 枚")
+        else:
+            status_text.text(f"⚠️ 画像を生成できませんでした")
+
+        # エラーがあればまとめて表示（上書きされずに残る）
+        if errors:
+            with error_container:
+                st.warning(f"⚠️ {len(errors)} 件のエラーが発生しました:")
+                for err in errors:
+                    st.error(err)
 
     # 生成中フラグOFF
     st.session_state.generating = False
