@@ -21,7 +21,6 @@ st.set_page_config(page_title="Banana Replica UI", page_icon="🍌", layout="wid
 # ==============================================================
 def check_password():
     """アプリ起動時にパスワード認証を行う。secrets にパスワード未設定の場合はスキップ。"""
-    # secrets に APP_PASSWORD が設定されていない場合（ローカル開発など）は認証スキップ
     try:
         app_password = st.secrets["APP_PASSWORD"]
     except (FileNotFoundError, KeyError):
@@ -69,9 +68,13 @@ def get_api_key():
 if "api_key" not in st.session_state:
     st.session_state.api_key = get_api_key()
 
-# ギャラリー蓄積用（ボタンを押すたびに5枚ずつ追加、最大50枚）
+# ギャラリー蓄積用（ボタンを押すたびに追加、最大50枚）
 if "gallery_images" not in st.session_state:
-    st.session_state.gallery_images = []  # 現在のギャラリーの画像パスリスト
+    st.session_state.gallery_images = []
+
+# 生成中フラグ（生成中はギャラリー操作を無効化）
+if "generating" not in st.session_state:
+    st.session_state.generating = False
 
 # 過去のプロンプト初期化
 past_prompts_file = Path(__file__).parent / "past_prompts.json"
@@ -99,6 +102,13 @@ if "current_prompt" not in st.session_state:
 
 def set_prompt(text):
     st.session_state.current_prompt = text
+
+# 生成枚数の選択用コールバック（rerunせずにセッション状態を更新）
+if "gen_count" not in st.session_state:
+    st.session_state.gen_count = 5
+
+def set_gen_count(count):
+    st.session_state.gen_count = count
 
 
 # ==============================================================
@@ -166,6 +176,21 @@ def show_gallery(images, gallery_key):
                     st.image(str(thumb_path), caption=label, use_container_width=True)
 
 
+def show_gallery_static(images):
+    """生成中に表示する静的ギャラリー（ボタンなし＝rerun不可）"""
+    valid_images = [p for p in images if p.exists()]
+    if not valid_images:
+        return
+    total = len(valid_images)
+    st.caption(f"🔒 生成中のためギャラリー操作は一時停止中（{total} 枚）")
+    # 最新5枚だけサムネイル表示
+    recent = valid_images[-5:]
+    cols = st.columns(len(recent))
+    for i, img_path in enumerate(recent):
+        with cols[i]:
+            st.image(str(img_path), caption=img_path.name, use_container_width=True)
+
+
 # ==== サイドバー ====
 with st.sidebar:
     st.header("⚙️ 設定")
@@ -228,11 +253,16 @@ with st.sidebar:
 
 # ==== メインエリア ====
 
-# --- 現在のギャラリー（蓄積された画像を ◀ ▶ で閲覧） ---
+# --- 現在のギャラリー ---
 if st.session_state.gallery_images:
     gallery_count = len(st.session_state.gallery_images)
     st.subheader(f"🖼️ 生成ギャラリー（{gallery_count} 枚）")
-    show_gallery(st.session_state.gallery_images, "main_gallery")
+    if st.session_state.generating:
+        # 生成中は静的表示（ボタンなし）→ rerun が発生しない
+        show_gallery_static(st.session_state.gallery_images)
+    else:
+        # 通常時はインタラクティブギャラリー
+        show_gallery(st.session_state.gallery_images, "main_gallery")
     st.markdown("---")
 
 # --- 過去の会話履歴 ---
@@ -255,10 +285,7 @@ if st.session_state.past_prompts:
             btn_label = past_prompt if len(past_prompt) <= 18 else past_prompt[:18] + "..."
             st.button(btn_label, key=f"past_btn_{idx}", help=past_prompt, on_click=set_prompt, args=(past_prompt,), use_container_width=True)
 
-# 生成枚数の選択
-if "gen_count" not in st.session_state:
-    st.session_state.gen_count = 5
-
+# 生成枚数の選択（on_clickコールバックで更新 → プロンプトが消えない）
 gallery_count = len(st.session_state.gallery_images)
 remaining = 50 - gallery_count
 is_max = remaining <= 0
@@ -268,14 +295,14 @@ count_cols = st.columns(4)
 for i, count in enumerate([3, 5, 10, 20]):
     with count_cols[i]:
         selected = st.session_state.gen_count == count
-        if st.button(
+        st.button(
             f"{'✅ ' if selected else ''}{count}枚",
             key=f"count_{count}",
             use_container_width=True,
             type="primary" if selected else "secondary",
-        ):
-            st.session_state.gen_count = count
-            st.rerun()
+            on_click=set_gen_count,
+            args=(count,),
+        )
 
 chosen_count = st.session_state.gen_count
 
@@ -287,19 +314,18 @@ else:
     target = min(gallery_count + chosen_count, 50)
     btn_label = f"✨ さらに{chosen_count}枚追加生成する（現在 {gallery_count} 枚 → {target} 枚）"
 
-# 入力フォーム
-with st.form(key="prompt_form"):
-    prompt = st.text_area(
-        "プロンプトまたは修正指示を入力してください... (例: オフィス背景で明るく)",
-        key="current_prompt",
-        height=400,
-    )
-    submit_button = st.form_submit_button(
-        label=btn_label,
-        use_container_width=True,
-        type="primary",
-        disabled=is_max,
-    )
+# 入力エリア（フォーム外に配置 → rerunしてもプロンプトが消えない）
+prompt = st.text_area(
+    "プロンプトまたは修正指示を入力してください... (例: オフィス背景で明るく)",
+    key="current_prompt",
+    height=400,
+)
+submit_button = st.button(
+    label=btn_label,
+    use_container_width=True,
+    type="primary",
+    disabled=is_max,
+)
 
 if submit_button and prompt and not is_max:
     save_prompt(prompt)
@@ -312,6 +338,9 @@ if submit_button and prompt and not is_max:
 
     # 今回生成する枚数（選択した枚数、ただし上限50枚を超えない）
     num_to_generate = min(st.session_state.gen_count, 50 - len(st.session_state.gallery_images))
+
+    # 生成中フラグON（ギャラリーを静的表示に切り替え）
+    st.session_state.generating = True
 
     # 生成処理
     with st.spinner(f"{num_to_generate}枚追加生成中... もうしばらくお待ちください！"):
@@ -374,6 +403,9 @@ if submit_button and prompt and not is_max:
 
         total_count = len(st.session_state.gallery_images)
         status_text.text(f"✅ {success} 枚追加完了！ ギャラリー合計: {total_count} 枚")
+
+    # 生成中フラグOFF
+    st.session_state.generating = False
 
     # UIを更新してギャラリーを表示
     st.rerun()
