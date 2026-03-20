@@ -405,7 +405,7 @@ if submit_button and prompt and not is_max:
 
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash-image",
+                    model="gemini-3-pro-image-preview",
                     contents=contents,
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE", "TEXT"],
