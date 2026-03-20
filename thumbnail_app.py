@@ -72,6 +72,12 @@ if "api_key" not in st.session_state:
 if "gallery_images" not in st.session_state:
     st.session_state.gallery_images = []
 
+# 生成結果メッセージ（rerun後も表示するため）
+if "last_gen_errors" not in st.session_state:
+    st.session_state.last_gen_errors = []
+if "last_gen_success" not in st.session_state:
+    st.session_state.last_gen_success = None
+
 # 生成中フラグ（生成中はギャラリー操作を無効化）
 if "generating" not in st.session_state:
     st.session_state.generating = False
@@ -265,6 +271,17 @@ if st.session_state.gallery_images:
         show_gallery(st.session_state.gallery_images, "main_gallery")
     st.markdown("---")
 
+# --- 前回の生成結果メッセージ（rerun後も表示） ---
+if st.session_state.last_gen_success is not None:
+    if st.session_state.last_gen_success > 0:
+        st.success(f"✅ {st.session_state.last_gen_success} 枚の画像を生成しました！")
+    else:
+        st.warning("⚠️ 画像を生成できませんでした")
+if st.session_state.last_gen_errors:
+    st.error(f"🔍 {len(st.session_state.last_gen_errors)} 件のエラー:")
+    for err in st.session_state.last_gen_errors:
+        st.error(err)
+
 # --- 過去の会話履歴 ---
 for msg_idx, message in enumerate(st.session_state.chat_history):
     with st.chat_message(message["role"]):
@@ -329,6 +346,9 @@ with st.form(key="prompt_form"):
     )
 
 if submit_button and prompt and not is_max:
+    # 前回のエラーをクリア
+    st.session_state.last_gen_errors = []
+    st.session_state.last_gen_success = None
     # フォーム送信時のプロンプトを保持（次回表示時に復元）
     st.session_state.current_prompt = prompt
     save_prompt(prompt)
@@ -430,12 +450,9 @@ if submit_button and prompt and not is_max:
         else:
             status_text.text(f"⚠️ 画像を生成できませんでした")
 
-        # エラーがあればまとめて表示（上書きされずに残る）
-        if errors:
-            with error_container:
-                st.warning(f"⚠️ {len(errors)} 件のエラーが発生しました:")
-                for err in errors:
-                    st.error(err)
+        # エラーをセッションに保存（rerun後も表示される）
+        st.session_state.last_gen_errors = errors
+        st.session_state.last_gen_success = success
 
     # 生成中フラグOFF
     st.session_state.generating = False
