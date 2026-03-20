@@ -314,20 +314,23 @@ else:
     target = min(gallery_count + chosen_count, 50)
     btn_label = f"✨ さらに{chosen_count}枚追加生成する（現在 {gallery_count} 枚 → {target} 枚）"
 
-# 入力エリア（フォーム外に配置 → rerunしてもプロンプトが消えない）
-prompt = st.text_area(
-    "プロンプトまたは修正指示を入力してください... (例: オフィス背景で明るく)",
-    key="current_prompt",
-    height=400,
-)
-submit_button = st.button(
-    label=btn_label,
-    use_container_width=True,
-    type="primary",
-    disabled=is_max,
-)
+# 入力フォーム（フォーム内なのでrerunが発生せずボタンが確実に動作）
+with st.form(key="prompt_form"):
+    prompt = st.text_area(
+        "プロンプトまたは修正指示を入力してください... (例: オフィス背景で明るく)",
+        value=st.session_state.current_prompt,
+        height=400,
+    )
+    submit_button = st.form_submit_button(
+        label=btn_label,
+        use_container_width=True,
+        type="primary",
+        disabled=is_max,
+    )
 
 if submit_button and prompt and not is_max:
+    # フォーム送信時のプロンプトを保持（次回表示時に復元）
+    st.session_state.current_prompt = prompt
     save_prompt(prompt)
 
     if not st.session_state.api_key:
