@@ -120,9 +120,14 @@ def set_gen_count(count):
 # ==============================================================
 # ギャラリー表示コンポーネント（◀ ▶ で画像を切り替え＋サムネ一覧）
 # ==============================================================
-@st.fragment
+def _go_prev(idx_key, total):
+    st.session_state[idx_key] = (st.session_state[idx_key] - 1) % total
+
+def _go_next(idx_key, total):
+    st.session_state[idx_key] = (st.session_state[idx_key] + 1) % total
+
 def show_gallery(images, gallery_key):
-    """◀ ▶ ボタンで大きな画像を切り替えて比較できるギャラリー（fragmentで独立rerun）"""
+    """◀ ▶ ボタンで大きな画像を切り替えて比較できるギャラリー"""
     valid_images = [p for p in images if p.exists()]
     if not valid_images:
         return
@@ -137,9 +142,8 @@ def show_gallery(images, gallery_key):
     # --- ナビゲーションバー: ◀前へ  [3 / 10]  次へ▶ ---
     nav_left, nav_center, nav_right = st.columns([1, 3, 1])
     with nav_left:
-        if st.button("◀ 前へ", key=f"prev_{gallery_key}", use_container_width=True, disabled=(total <= 1)):
-            st.session_state[idx_key] = (idx - 1) % total
-            st.rerun(scope="fragment")
+        st.button("◀ 前へ", key=f"prev_{gallery_key}", use_container_width=True,
+                  disabled=(total <= 1), on_click=_go_prev, args=(idx_key, total))
     with nav_center:
         st.markdown(
             f"<p style='text-align:center; font-size:1.3rem; font-weight:bold; margin:0.3rem 0;'>"
@@ -147,9 +151,8 @@ def show_gallery(images, gallery_key):
             unsafe_allow_html=True,
         )
     with nav_right:
-        if st.button("次へ ▶", key=f"next_{gallery_key}", use_container_width=True, disabled=(total <= 1)):
-            st.session_state[idx_key] = (idx + 1) % total
-            st.rerun(scope="fragment")
+        st.button("次へ ▶", key=f"next_{gallery_key}", use_container_width=True,
+                  disabled=(total <= 1), on_click=_go_next, args=(idx_key, total))
 
     # --- メイン画像（大きく表示） ---
     _, center_col, _ = st.columns([1, 6, 1])
