@@ -359,18 +359,6 @@ if submit_button and prompt and not is_max:
 
     client = genai.Client(api_key=st.session_state.api_key)
 
-    # 利用可能なモデル一覧を取得してデバッグ表示
-    try:
-        available_models = []
-        for m in client.models.list():
-            model_name = m.name if hasattr(m, 'name') else str(m)
-            if 'image' in model_name.lower() or 'flash' in model_name.lower() or 'pro' in model_name.lower():
-                available_models.append(model_name)
-        if available_models:
-            st.info(f"🔍 利用可能な画像関連モデル: {', '.join(available_models[:15])}")
-    except Exception as e:
-        st.warning(f"モデル一覧取得エラー: {e}")
-
     # 今回生成する枚数（選択した枚数、ただし上限50枚を超えない）
     num_to_generate = min(st.session_state.gen_count, 50 - len(st.session_state.gallery_images))
 
@@ -417,7 +405,7 @@ if submit_button and prompt and not is_max:
 
             try:
                 response = client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
+                    model="gemini-2.5-flash-image",
                     contents=contents,
                     config=types.GenerateContentConfig(
                         response_modalities=["IMAGE", "TEXT"],
