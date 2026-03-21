@@ -399,62 +399,74 @@ if submit_button and prompt and not is_max:
         # 通し番号は既存の枚数 + 1 から開始
         start_num = len(st.session_state.gallery_images) + 1
 
+        import time
+        MAX_RETRIES = 3  # ブロック時の最大リトライ回数
+
         for i in range(num_to_generate):
             img_num = start_num + i
             filename = f"replica_{timestamp}_{img_num:02d}.png"
             filepath = output_dir / filename
 
-            status_text.text(f"生成中 [{i + 1}/{num_to_generate}] ... （合計 {img_num} 枚目）")
+            image_generated = False
 
-            try:
-                response = client.models.generate_content(
-                    model="gemini-3-pro-image-preview",
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE", "TEXT"],
-                    ),
-                )
+            for attempt in range(MAX_RETRIES):
+                retry_label = f"（リトライ {attempt + 1}/{MAX_RETRIES}）" if attempt > 0 else ""
+                status_text.text(f"生成中 [{i + 1}/{num_to_generate}] ... （合計 {img_num} 枚目）{retry_label}")
 
-                # レスポンスの検証（詳細なデバッグ情報）
-                if not response.candidates:
-                    debug_info = f"画像 {img_num}: candidatesなし"
-                    # ブロック理由を確認
-                    if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                        debug_info += f" | prompt_feedback: {response.prompt_feedback}"
-                    if hasattr(response, 'filters') and response.filters:
-                        debug_info += f" | filters: {response.filters}"
-                    # レスポンス全体の情報
-                    debug_info += f" | response型: {type(response).__name__}"
-                    try:
-                        debug_info += f" | response属性: {[a for a in dir(response) if not a.startswith('_')]}"
-                    except:
-                        pass
-                    errors.append(debug_info)
-                    progress_bar.progress((i + 1) / num_to_generate)
-                    continue
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-3-pro-image-preview",
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE", "TEXT"],
+                        ),
+                    )
 
-                # 画像データを探す
-                image_found = False
-                text_response = ""
-                for part in response.candidates[0].content.parts:
-                    if part.inline_data is not None:
-                        with open(filepath, "wb") as f:
-                            f.write(part.inline_data.data)
-                        st.session_state.gallery_images.append(filepath)
-                        success += 1
-                        image_found = True
-                        break
-                    elif part.text:
-                        text_response = part.text
+                    # candidatesが空 → ブロックされた場合リトライ
+                    if not response.candidates:
+                        block_reason = ""
+                        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                            block_reason = str(getattr(response.prompt_feedback, 'block_reason', ''))
+                        # リトライ可能なブロック（OTHER / RESOURCE_EXHAUSTED）
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(2 * (attempt + 1))  # 2秒, 4秒と待機
+                            continue
+                        else:
+                            errors.append(f"画像 {img_num}: {MAX_RETRIES}回リトライ後も生成失敗（{block_reason}）")
+                            break
 
-                if not image_found:
-                    err_detail = f"画像 {img_num}: 画像データなし"
-                    if text_response:
-                        err_detail += f"（API応答: {text_response[:100]}）"
-                    errors.append(err_detail)
+                    # 画像データを探す
+                    image_found = False
+                    text_response = ""
+                    for part in response.candidates[0].content.parts:
+                        if part.inline_data is not None:
+                            with open(filepath, "wb") as f:
+                                f.write(part.inline_data.data)
+                            st.session_state.gallery_images.append(filepath)
+                            success += 1
+                            image_found = True
+                            image_generated = True
+                            break
+                        elif part.text:
+                            text_response = part.text
 
-            except Exception as e:
-                errors.append(f"画像 {img_num}: {str(e)[:150]}")
+                    if not image_found:
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(2 * (attempt + 1))
+                            continue
+                        err_detail = f"画像 {img_num}: 画像データなし"
+                        if text_response:
+                            err_detail += f"（API応答: {text_response[:100]}）"
+                        errors.append(err_detail)
+                    break  # 成功 or 最終リトライ後 → 次の画像へ
+
+                except Exception as e:
+                    if attempt < MAX_RETRIES - 1 and ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)):
+                        status_text.text(f"⏳ レート制限のため待機中... [{i + 1}/{num_to_generate}]（{attempt + 1}回目）")
+                        time.sleep(5 * (attempt + 1))  # 5秒, 10秒と待機
+                        continue
+                    errors.append(f"画像 {img_num}: {str(e)[:150]}")
+                    break
 
             progress_bar.progress((i + 1) / num_to_generate)
 
