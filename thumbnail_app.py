@@ -37,15 +37,19 @@ class GenerationState:
         self.finished = False     # スレッド完了フラグ
 
 
-_gen_states = {}
-_gen_states_lock = threading.Lock()
+@st.cache_resource
+def _init_gen_store():
+    """スクリプト再実行でもリセットされない永続ストア"""
+    return {"states": {}, "lock": threading.Lock()}
+
+_gen_store = _init_gen_store()
 
 
 def get_gen_state(session_id):
-    with _gen_states_lock:
-        if session_id not in _gen_states:
-            _gen_states[session_id] = GenerationState()
-        return _gen_states[session_id]
+    with _gen_store["lock"]:
+        if session_id not in _gen_store["states"]:
+            _gen_store["states"][session_id] = GenerationState()
+        return _gen_store["states"][session_id]
 
 
 def generation_worker(session_id, api_key, contents, num_to_generate,
