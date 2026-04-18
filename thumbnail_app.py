@@ -15,6 +15,15 @@ except ImportError:
     st.error("エラー: google-genai が必要です。 pip install google-genai を実行してください。")
     st.stop()
 
+# ブラウザのlocalStorageに永続保存するためのコンポーネント
+# （Streamlit Cloudのファイルシステムは揮発性のため、サーバー側ファイル保存だけでは
+#  コンテナ再起動時にプロンプト履歴が消えてしまう問題への対処）
+try:
+    from streamlit_local_storage import LocalStorage
+    _LS_AVAILABLE = True
+except ImportError:
+    _LS_AVAILABLE = False
+
 # ページ設定
 st.set_page_config(page_title="Banana Replica UI", page_icon="🍌", layout="wide")
 
@@ -217,20 +226,70 @@ if "generating" not in st.session_state:
     st.session_state.generating = False
 
 # 過去のプロンプト初期化
+# 永続化戦略:
+#   1. ブラウザのlocalStorage を主ストレージとする（Streamlit Cloud再起動に強い）
+#   2. サーバー側JSONファイルをフォールバックとする（初回アクセス時・LS無効時）
+#   3. 保存時は両方に書き込む
 past_prompts_file = Path(__file__).parent / "past_prompts.json"
-if "past_prompts" not in st.session_state:
+
+# LocalStorage インスタンスの初期化（可能であれば）
+_ls_instance = LocalStorage() if _LS_AVAILABLE else None
+_LS_KEY = "banana_past_prompts"
+
+def _load_prompts_from_ls():
+    """localStorage から past_prompts を読み出す。失敗時は None を返す。"""
+    if _ls_instance is None:
+        return None
+    try:
+        raw = _ls_instance.getItem(_LS_KEY)
+        if raw is None:
+            return None
+        # コンポーネントは str / list / dict を返す可能性があるため両対応
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, list):
+            return raw
+        return None
+    except Exception:
+        return None
+
+def _load_prompts_from_file():
+    """サーバー側JSONファイルから past_prompts を読み出す。"""
     if past_prompts_file.exists():
-        with open(past_prompts_file, "r", encoding="utf-8") as f:
-            st.session_state.past_prompts = json.load(f)
+        try:
+            with open(past_prompts_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+if "past_prompts" not in st.session_state:
+    # localStorage優先で読み込み、無ければファイルにフォールバック
+    ls_data = _load_prompts_from_ls()
+    if ls_data:
+        st.session_state.past_prompts = ls_data
     else:
-        st.session_state.past_prompts = []
+        st.session_state.past_prompts = _load_prompts_from_file()
 
 def save_prompt(new_prompt):
     if new_prompt and new_prompt not in st.session_state.past_prompts:
         st.session_state.past_prompts.insert(0, new_prompt)
         st.session_state.past_prompts = st.session_state.past_prompts[:50]
-        with open(past_prompts_file, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
+        # localStorage に保存（永続）
+        if _ls_instance is not None:
+            try:
+                _ls_instance.setItem(
+                    _LS_KEY,
+                    json.dumps(st.session_state.past_prompts, ensure_ascii=False),
+                )
+            except Exception:
+                pass  # LS書き込み失敗はサイレントに無視
+        # サーバー側ファイルにもバックアップ保存（コンテナ存命中のみ有効）
+        try:
+            with open(past_prompts_file, "w", encoding="utf-8") as f:
+                json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # 読み取り専用FS等でも動くように
 
 # 出力ディレクトリ
 output_dir = Path(__file__).parent / "replica_output"
@@ -424,11 +483,25 @@ with st.sidebar:
             st.rerun()
 
     st.header("👤 キャラクター設定")
-    use_illustration = st.checkbox("すあし社長のイラストを含める", value=True)
-    if use_illustration:
+    illustration_mode = st.radio(
+        "すあし社長のイラスト",
+        options=["焦っている（固定）", "通常", "含めない"],
+        index=0,  # デフォルトは「焦っている（固定）」
+        key="illustration_mode",
+    )
+    # 選択に応じた画像ファイルのパスを決定
+    if illustration_mode == "通常":
         ill_path = Path(__file__).parent / "illustration.png"
-        if not ill_path.exists():
-            st.warning("illustration.png が見つかりません。")
+    elif illustration_mode == "焦っている（固定）":
+        ill_path = Path(__file__).parent / "illustration_panic.png"
+    else:
+        ill_path = None
+
+    if ill_path is not None and not ill_path.exists():
+        st.warning(f"{ill_path.name} が見つかりません。")
+
+    # 旧APIとの互換のためのフラグ
+    use_illustration = (illustration_mode != "含めない")
 
     st.header("🖼️ 追加の参考画像 (任意)")
     st.markdown("他にも参考にしたい画像があればアップロードしてください")
@@ -576,13 +649,21 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
     # APIへの送信コンテンツ構築
     contents = [prompt]
 
-    if use_illustration:
-        ill_path = Path(__file__).parent / "illustration.png"
-        if ill_path.exists():
-            with open(ill_path, "rb") as f:
-                ill_data = f.read()
-            ill_part = types.Part.from_bytes(data=ill_data, mime_type="image/png")
-            contents.append(ill_part)
+    # illustration_mode に応じて参考画像を切り替え
+    # （"焦っている（固定）" / "通常" / "含めない" のいずれか）
+    selected_mode = st.session_state.get("illustration_mode", "焦っている（固定）")
+    if selected_mode == "通常":
+        gen_ill_path = Path(__file__).parent / "illustration.png"
+    elif selected_mode == "焦っている（固定）":
+        gen_ill_path = Path(__file__).parent / "illustration_panic.png"
+    else:
+        gen_ill_path = None
+
+    if gen_ill_path is not None and gen_ill_path.exists():
+        with open(gen_ill_path, "rb") as f:
+            ill_data = f.read()
+        ill_part = types.Part.from_bytes(data=ill_data, mime_type="image/png")
+        contents.append(ill_part)
 
     if uploaded_files:
         for file in uploaded_files:
