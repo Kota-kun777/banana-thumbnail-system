@@ -1,6 +1,8 @@
 import os
+import io
 import json
 import time
+import base64
 import threading
 import uuid
 import streamlit as st
@@ -15,6 +17,13 @@ except ImportError:
     st.error("エラー: google-genai が必要です。 pip install google-genai を実行してください。")
     st.stop()
 
+# OpenAI Images 2.0（gpt-image-2 系）を任意で利用
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except ImportError:
+    _OPENAI_AVAILABLE = False
+
 # ブラウザのlocalStorageに永続保存するためのコンポーネント
 # （Streamlit Cloudのファイルシステムは揮発性のため、サーバー側ファイル保存だけでは
 #  コンテナ再起動時にプロンプト履歴が消えてしまう問題への対処）
@@ -23,6 +32,17 @@ try:
     _LS_AVAILABLE = True
 except ImportError:
     _LS_AVAILABLE = False
+
+# ==============================================================
+# 画像生成モデル設定
+# ==============================================================
+GEMINI_IMAGE_MODEL = "gemini-3-pro-image-preview"
+# OpenAI は 2026年時点の最新 gpt-image-2 をデフォルトに。アクセス不可の場合は
+# サイドバーの詳細設定で gpt-image-1 系へ切り替え可能。
+OPENAI_IMAGE_MODEL_DEFAULT = "gpt-image-2"
+OPENAI_IMAGE_MODEL_OPTIONS = ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"]
+OPENAI_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]  # 先頭=横長(YouTube向き)
+OPENAI_QUALITY_OPTIONS = ["high", "medium", "low", "auto"]
 
 # ページ設定
 st.set_page_config(page_title="Banana Replica UI", page_icon="🍌", layout="wide")
@@ -61,15 +81,85 @@ def get_gen_state(session_id):
         return _gen_store["states"][session_id]
 
 
-def generation_worker(session_id, api_key, contents, num_to_generate,
-                      output_dir, timestamp, start_num):
+def _generate_one_gemini(api_key, prompt, image_bytes_list):
+    """Gemini 3 Pro で画像を1枚生成。成功: (bytes, None) / 失敗: (None, 理由)"""
+    client = genai.Client(api_key=api_key)
+    contents = [prompt]
+    for img_bytes in image_bytes_list:
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+
+    response = client.models.generate_content(
+        model=GEMINI_IMAGE_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+        ),
+    )
+
+    if not response.candidates:
+        block_reason = ""
+        if hasattr(response, "prompt_feedback") and response.prompt_feedback:
+            block_reason = str(getattr(response.prompt_feedback, "block_reason", ""))
+        return None, f"ブロック（{block_reason}）" if block_reason else "ブロック"
+
+    text_response = ""
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data, None
+        if part.text:
+            text_response = part.text
+
+    if text_response:
+        return None, f"画像データなし（API応答: {text_response[:100]}）"
+    return None, "画像データなし"
+
+
+def _generate_one_openai(api_key, prompt, image_bytes_list, model, size, quality):
+    """OpenAI Images 2.0 で画像を1枚生成。成功: (bytes, None) / 失敗: (None, 理由)"""
+    if not _OPENAI_AVAILABLE:
+        return None, "openai パッケージが未インストール"
+
+    client = OpenAI(api_key=api_key)
+    kwargs = {
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "quality": quality,
+        "n": 1,
+    }
+
+    if image_bytes_list:
+        # ファイル風オブジェクトにnameを付けて渡す（SDKがmime判定に使う）
+        image_files = []
+        for i, img_bytes in enumerate(image_bytes_list):
+            bio = io.BytesIO(img_bytes)
+            bio.name = f"input_{i}.png"
+            image_files.append(bio)
+        kwargs["image"] = image_files
+        result = client.images.edit(**kwargs)
+    else:
+        result = client.images.generate(**kwargs)
+
+    data = result.data[0]
+    if getattr(data, "b64_json", None):
+        return base64.b64decode(data.b64_json), None
+    if getattr(data, "url", None):
+        import urllib.request
+        with urllib.request.urlopen(data.url) as resp:
+            return resp.read(), None
+    return None, "画像データなし"
+
+
+def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
+                      num_to_generate, output_dir, timestamp, start_num,
+                      openai_model=OPENAI_IMAGE_MODEL_DEFAULT,
+                      openai_size="1536x1024",
+                      openai_quality="high"):
     """バックグラウンドスレッドで画像を生成するワーカー関数"""
     state = get_gen_state(session_id)
     MAX_RETRIES = 3
 
     try:
-        client = genai.Client(api_key=api_key)
-
         for i in range(num_to_generate):
             if state.stop_requested:
                 with state.lock:
@@ -85,65 +175,58 @@ def generation_worker(session_id, api_key, contents, num_to_generate,
                     break
 
                 retry_label = f"（リトライ {attempt + 1}/{MAX_RETRIES}）" if attempt > 0 else ""
+                engine_label = "OpenAI" if provider == "openai" else "Gemini"
                 with state.lock:
-                    state.status = f"生成中 [{i + 1}/{num_to_generate}] ...（合計 {img_num} 枚目）{retry_label}"
-
-                try:
-                    response = client.models.generate_content(
-                        model="gemini-3-pro-image-preview",
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            response_modalities=["IMAGE", "TEXT"],
-                        ),
+                    state.status = (
+                        f"[{engine_label}] 生成中 [{i + 1}/{num_to_generate}] "
+                        f"...（合計 {img_num} 枚目）{retry_label}"
                     )
 
-                    # candidatesが空 → ブロックされた場合リトライ
-                    if not response.candidates:
-                        block_reason = ""
-                        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                            block_reason = str(getattr(response.prompt_feedback, 'block_reason', ''))
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(2 * (attempt + 1))
-                            continue
-                        else:
-                            with state.lock:
-                                state.errors.append(f"画像 {img_num}: {MAX_RETRIES}回リトライ後も生成失敗（{block_reason}）")
-                            break
+                try:
+                    if provider == "openai":
+                        img_bytes, err = _generate_one_openai(
+                            api_key, prompt, image_bytes_list,
+                            openai_model, openai_size, openai_quality,
+                        )
+                    else:
+                        img_bytes, err = _generate_one_gemini(
+                            api_key, prompt, image_bytes_list,
+                        )
 
-                    # 画像データを探す
-                    image_found = False
-                    text_response = ""
-                    for part in response.candidates[0].content.parts:
-                        if part.inline_data is not None:
-                            with open(filepath, "wb") as f:
-                                f.write(part.inline_data.data)
-                            with state.lock:
-                                state.images.append(str(filepath))
-                                state.success_count += 1
-                            image_found = True
-                            break
-                        elif part.text:
-                            text_response = part.text
-
-                    if not image_found:
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(2 * (attempt + 1))
-                            continue
-                        err_detail = f"画像 {img_num}: 画像データなし"
-                        if text_response:
-                            err_detail += f"（API応答: {text_response[:100]}）"
+                    if img_bytes is not None:
+                        with open(filepath, "wb") as f:
+                            f.write(img_bytes)
                         with state.lock:
-                            state.errors.append(err_detail)
-                    break  # 成功 or 最終リトライ後 → 次の画像へ
+                            state.images.append(str(filepath))
+                            state.success_count += 1
+                        break  # 成功 → 次の画像へ
+
+                    # エンジンが失敗理由を返した
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    with state.lock:
+                        state.errors.append(f"画像 {img_num}: {err}")
+                    break
 
                 except Exception as e:
-                    if attempt < MAX_RETRIES - 1 and ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)):
+                    err_str = str(e)
+                    # レート制限 or 一時エラーはリトライ
+                    is_rate_limit = (
+                        "429" in err_str
+                        or "RESOURCE_EXHAUSTED" in err_str
+                        or "rate_limit" in err_str.lower()
+                    )
+                    if attempt < MAX_RETRIES - 1 and is_rate_limit:
                         with state.lock:
-                            state.status = f"⏳ レート制限のため待機中... [{i + 1}/{num_to_generate}]（{attempt + 1}回目）"
+                            state.status = (
+                                f"⏳ レート制限のため待機中... "
+                                f"[{i + 1}/{num_to_generate}]（{attempt + 1}回目）"
+                            )
                         time.sleep(5 * (attempt + 1))
                         continue
                     with state.lock:
-                        state.errors.append(f"画像 {img_num}: {str(e)[:150]}")
+                        state.errors.append(f"画像 {img_num}: {err_str[:200]}")
                     break
 
             with state.lock:
@@ -198,18 +281,41 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
 # APIキーの取得優先順位: Secrets → 環境変数 → サイドバー入力
-def get_api_key():
-    """Streamlit Secrets > 環境変数 > 手動入力 の順にAPIキーを取得"""
+def _get_secret(key):
     try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if key:
-            return key
+        v = st.secrets.get(key, "")
+        if v:
+            return v
     except (FileNotFoundError, KeyError):
         pass
-    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    return ""
 
-if "api_key" not in st.session_state:
-    st.session_state.api_key = get_api_key()
+
+def get_gemini_api_key():
+    return (
+        _get_secret("GEMINI_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or ""
+    )
+
+
+def get_openai_api_key():
+    return _get_secret("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+
+
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = get_gemini_api_key()
+if "openai_api_key" not in st.session_state:
+    st.session_state.openai_api_key = get_openai_api_key()
+if "provider_key" not in st.session_state:
+    st.session_state.provider_key = "gemini"
+if "openai_model" not in st.session_state:
+    st.session_state.openai_model = OPENAI_IMAGE_MODEL_DEFAULT
+if "openai_size" not in st.session_state:
+    st.session_state.openai_size = OPENAI_SIZE_OPTIONS[0]
+if "openai_quality" not in st.session_state:
+    st.session_state.openai_quality = OPENAI_QUALITY_OPTIONS[0]
 
 # ギャラリー蓄積用（ボタンを押すたびに追加、最大50枚）
 if "gallery_images" not in st.session_state:
@@ -517,21 +623,80 @@ def generation_monitor():
 # ==== サイドバー ====
 with st.sidebar:
     st.header("⚙️ 設定")
-    # Secrets にAPIキーが設定済みならサイドバーの入力欄を非表示にする
-    api_from_secrets = False
-    try:
-        if st.secrets.get("GEMINI_API_KEY", ""):
-            api_from_secrets = True
-    except (FileNotFoundError, KeyError):
-        pass
 
-    if api_from_secrets:
-        st.success("✅ APIキー設定済み")
+    # --- 画像生成モデル選択 ---
+    provider_display = st.radio(
+        "画像生成モデル",
+        options=["🍌 Gemini 3 Pro (nano-banana)", "🎨 OpenAI Images 2.0"],
+        index=0 if st.session_state.provider_key == "gemini" else 1,
+        key="provider_display",
+        help=(
+            "Gemini: 実在人物のイラスト化が緩い／文字再現はやや弱い\n"
+            "OpenAI: 文字・構図が安定／実在の政治家などはほぼ生成不可"
+        ),
+    )
+    provider_key = "gemini" if "Gemini" in provider_display else "openai"
+    st.session_state.provider_key = provider_key
+
+    # --- 選択モデルの APIキー状態 ---
+    gemini_from_secrets = bool(_get_secret("GEMINI_API_KEY"))
+    openai_from_secrets = bool(_get_secret("OPENAI_API_KEY"))
+
+    if provider_key == "gemini":
+        if gemini_from_secrets:
+            st.success("✅ Gemini API Key 設定済み")
+        else:
+            gem_input = st.text_input(
+                "Gemini API Key",
+                value=st.session_state.gemini_api_key,
+                type="password",
+                key="gem_api_input",
+            )
+            if gem_input != st.session_state.gemini_api_key:
+                st.session_state.gemini_api_key = gem_input
+                st.rerun()
     else:
-        api_key_input = st.text_input("Gemini API Key", value=st.session_state.api_key, type="password")
-        if api_key_input != st.session_state.api_key:
-            st.session_state.api_key = api_key_input
-            st.rerun()
+        if openai_from_secrets:
+            st.success("✅ OpenAI API Key 設定済み")
+        else:
+            oai_input = st.text_input(
+                "OpenAI API Key",
+                value=st.session_state.openai_api_key,
+                type="password",
+                key="oai_api_input",
+            )
+            if oai_input != st.session_state.openai_api_key:
+                st.session_state.openai_api_key = oai_input
+                st.rerun()
+
+        # OpenAI 詳細設定（デフォルトで良ければ触らなくてOK）
+        with st.expander("🔧 OpenAI 詳細設定"):
+            st.selectbox(
+                "モデル",
+                options=OPENAI_IMAGE_MODEL_OPTIONS,
+                index=OPENAI_IMAGE_MODEL_OPTIONS.index(st.session_state.openai_model)
+                if st.session_state.openai_model in OPENAI_IMAGE_MODEL_OPTIONS
+                else 0,
+                key="openai_model",
+                help="アクセス不可エラーが出たら gpt-image-1 系に切り替え",
+            )
+            st.selectbox(
+                "サイズ",
+                options=OPENAI_SIZE_OPTIONS,
+                index=OPENAI_SIZE_OPTIONS.index(st.session_state.openai_size)
+                if st.session_state.openai_size in OPENAI_SIZE_OPTIONS
+                else 0,
+                key="openai_size",
+                help="1536x1024 が YouTube 16:9 に最も近い",
+            )
+            st.selectbox(
+                "品質",
+                options=OPENAI_QUALITY_OPTIONS,
+                index=OPENAI_QUALITY_OPTIONS.index(st.session_state.openai_quality)
+                if st.session_state.openai_quality in OPENAI_QUALITY_OPTIONS
+                else 0,
+                key="openai_quality",
+            )
 
     st.header("👤 キャラクター設定")
     illustration_mode = st.radio(
@@ -737,20 +902,26 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
     st.session_state.current_prompt = prompt
     save_prompt(prompt)
 
-    if not st.session_state.api_key:
-        st.error("左のサイドバーから Gemini API Key を設定してください。")
-        st.stop()
+    provider = st.session_state.get("provider_key", "gemini")
+    if provider == "openai":
+        api_key = st.session_state.openai_api_key
+        if not api_key:
+            st.error("左のサイドバーから OpenAI API Key を設定してください。")
+            st.stop()
+    else:
+        api_key = st.session_state.gemini_api_key
+        if not api_key:
+            st.error("左のサイドバーから Gemini API Key を設定してください。")
+            st.stop()
 
     # 今回生成する枚数（選択した枚数、ただし上限50枚を超えない）
     num_to_generate = min(st.session_state.gen_count, 50 - len(st.session_state.gallery_images))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     start_num = len(st.session_state.gallery_images) + 1
 
-    # APIへの送信コンテンツ構築
-    contents = [prompt]
+    # 参考画像のバイト列を収集（エンジンに依存しない形で渡す）
+    image_bytes_list = []
 
-    # illustration_mode に応じて参考画像を切り替え
-    # （"焦っている（固定）" / "通常" / "含めない" のいずれか）
     selected_mode = st.session_state.get("illustration_mode", "焦っている（固定）")
     if selected_mode == "通常":
         gen_ill_path = Path(__file__).parent / "illustration.png"
@@ -761,14 +932,11 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
 
     if gen_ill_path is not None and gen_ill_path.exists():
         with open(gen_ill_path, "rb") as f:
-            ill_data = f.read()
-        ill_part = types.Part.from_bytes(data=ill_data, mime_type="image/png")
-        contents.append(ill_part)
+            image_bytes_list.append(f.read())
 
     if uploaded_files:
         for file in uploaded_files:
-            image_part = types.Part.from_bytes(data=file.getvalue(), mime_type=file.type)
-            contents.append(image_part)
+            image_bytes_list.append(file.getvalue())
 
     # バックグラウンドスレッドで生成開始
     sid = st.session_state.session_id
@@ -787,8 +955,13 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
 
     thread = threading.Thread(
         target=generation_worker,
-        args=(sid, st.session_state.api_key, contents, num_to_generate,
-              output_dir, timestamp, start_num),
+        args=(
+            sid, provider, api_key, prompt, image_bytes_list, num_to_generate,
+            output_dir, timestamp, start_num,
+            st.session_state.openai_model,
+            st.session_state.openai_size,
+            st.session_state.openai_quality,
+        ),
         daemon=True,
     )
     thread.start()
