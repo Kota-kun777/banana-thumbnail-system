@@ -40,14 +40,13 @@ GEMINI_IMAGE_MODEL = "gemini-3-pro-image-preview"
 # OpenAI は 2026年時点の最新 gpt-image-2 をデフォルトに。アクセス不可の場合は
 # サイドバーの詳細設定で gpt-image-1 系へ切り替え可能。
 OPENAI_IMAGE_MODEL_DEFAULT = "gpt-image-2"
-OPENAI_IMAGE_MODEL_OPTIONS = ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"]
-# gpt-image-2 は "thousands of valid resolutions" をサポート（公式）、
-# gpt-image-1 系は 1024x1024 / 1536x1024 / 1024x1536 の3サイズ固定。
-# YouTube サムネは 16:9 ネイティブ（1920x1080）を最優先。
+# gpt-image-2 は「幅・高さとも16の倍数」制約あり（1920x1080 等は NG）。
+# 以下は 16:9 ぴったり＋16の倍数を満たすサイズ。
 OPENAI_SIZE_OPTIONS = [
-    "1920x1080",   # 16:9 ネイティブ（gpt-image-2 で対応）
-    "1792x1024",   # 16:9 近似（gpt-image-2 で対応、約1.75:1）
-    "1536x1024",   # 3:2 横長（全モデル対応、クロップで16:9に）
+    "2048x1152",   # 16:9 高解像（2K相当）
+    "1792x1008",   # 16:9 中解像
+    "1536x864",    # 16:9 標準解像（推奨）
+    "1024x576",    # 16:9 低解像（高速生成）
     "1024x1024",   # 1:1 正方形
     "1024x1536",   # 2:3 縦長
 ]
@@ -718,35 +717,34 @@ with st.sidebar:
 
         # OpenAI 詳細設定（デフォルトで良ければ触らなくてOK）
         with st.expander("🔧 OpenAI 詳細設定"):
-            st.selectbox(
-                "モデル",
-                options=OPENAI_IMAGE_MODEL_OPTIONS,
-                index=OPENAI_IMAGE_MODEL_OPTIONS.index(st.session_state.openai_model)
-                if st.session_state.openai_model in OPENAI_IMAGE_MODEL_OPTIONS
-                else 0,
-                key="openai_model",
-                help="アクセス不可エラーが出たら gpt-image-1 系に切り替え",
-            )
+            st.caption(f"モデル: `{OPENAI_IMAGE_MODEL_DEFAULT}` 固定")
+            # 既定を 1536x864（16:9 ぴったり・標準解像）に寄せる
+            if st.session_state.openai_size not in OPENAI_SIZE_OPTIONS:
+                default_size_idx = OPENAI_SIZE_OPTIONS.index("1536x864")
+            else:
+                default_size_idx = OPENAI_SIZE_OPTIONS.index(st.session_state.openai_size)
             st.selectbox(
                 "サイズ",
                 options=OPENAI_SIZE_OPTIONS + ["カスタム"],
-                index=OPENAI_SIZE_OPTIONS.index(st.session_state.openai_size)
-                if st.session_state.openai_size in OPENAI_SIZE_OPTIONS
-                else len(OPENAI_SIZE_OPTIONS),
+                index=default_size_idx,
                 key="openai_size_choice",
                 help=(
-                    "1920x1080 = 16:9 ネイティブ（gpt-image-2 のみ対応）\n"
-                    "1536x1024 = 3:2（全モデル対応、クロップで16:9）\n"
-                    "gpt-image-1 系で 1920x1080 等を選ぶとエラーになる可能性"
+                    "2048x1152 / 1792x1008 / 1536x864 / 1024x576 は 16:9 "
+                    "ぴったりでネイティブ生成（クロップ不要）。"
+                    "カスタムは幅・高さとも16の倍数であること"
                 ),
             )
             if st.session_state.openai_size_choice == "カスタム":
-                custom_in = st.text_input(
-                    "カスタムサイズ（例: 1600x900）",
-                    value=st.session_state.openai_size
+                custom_default = (
+                    st.session_state.openai_size
                     if st.session_state.openai_size not in OPENAI_SIZE_OPTIONS
-                    else "1600x900",
+                    else "2048x1152"
+                )
+                custom_in = st.text_input(
+                    "カスタムサイズ（幅・高さとも16の倍数）",
+                    value=custom_default,
                     key="openai_size_custom",
+                    help="例: 2048x1152（16:9）、1792x1008、1344x768 など",
                 )
                 st.session_state.openai_size = custom_in.strip()
             else:
