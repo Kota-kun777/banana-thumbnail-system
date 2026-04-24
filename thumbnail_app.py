@@ -41,7 +41,16 @@ GEMINI_IMAGE_MODEL = "gemini-3-pro-image-preview"
 # サイドバーの詳細設定で gpt-image-1 系へ切り替え可能。
 OPENAI_IMAGE_MODEL_DEFAULT = "gpt-image-2"
 OPENAI_IMAGE_MODEL_OPTIONS = ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"]
-OPENAI_SIZE_OPTIONS = ["1536x1024", "1024x1024", "1024x1536"]  # 先頭=横長(YouTube向き)
+# gpt-image-2 は "thousands of valid resolutions" をサポート（公式）、
+# gpt-image-1 系は 1024x1024 / 1536x1024 / 1024x1536 の3サイズ固定。
+# YouTube サムネは 16:9 ネイティブ（1920x1080）を最優先。
+OPENAI_SIZE_OPTIONS = [
+    "1920x1080",   # 16:9 ネイティブ（gpt-image-2 で対応）
+    "1792x1024",   # 16:9 近似（gpt-image-2 で対応、約1.75:1）
+    "1536x1024",   # 3:2 横長（全モデル対応、クロップで16:9に）
+    "1024x1024",   # 1:1 正方形
+    "1024x1536",   # 2:3 縦長
+]
 OPENAI_QUALITY_OPTIONS = ["high", "medium", "low", "auto"]
 
 # ページ設定
@@ -720,13 +729,28 @@ with st.sidebar:
             )
             st.selectbox(
                 "サイズ",
-                options=OPENAI_SIZE_OPTIONS,
+                options=OPENAI_SIZE_OPTIONS + ["カスタム"],
                 index=OPENAI_SIZE_OPTIONS.index(st.session_state.openai_size)
                 if st.session_state.openai_size in OPENAI_SIZE_OPTIONS
-                else 0,
-                key="openai_size",
-                help="1536x1024 が YouTube 16:9 に最も近い",
+                else len(OPENAI_SIZE_OPTIONS),
+                key="openai_size_choice",
+                help=(
+                    "1920x1080 = 16:9 ネイティブ（gpt-image-2 のみ対応）\n"
+                    "1536x1024 = 3:2（全モデル対応、クロップで16:9）\n"
+                    "gpt-image-1 系で 1920x1080 等を選ぶとエラーになる可能性"
+                ),
             )
+            if st.session_state.openai_size_choice == "カスタム":
+                custom_in = st.text_input(
+                    "カスタムサイズ（例: 1600x900）",
+                    value=st.session_state.openai_size
+                    if st.session_state.openai_size not in OPENAI_SIZE_OPTIONS
+                    else "1600x900",
+                    key="openai_size_custom",
+                )
+                st.session_state.openai_size = custom_in.strip()
+            else:
+                st.session_state.openai_size = st.session_state.openai_size_choice
             st.selectbox(
                 "品質",
                 options=OPENAI_QUALITY_OPTIONS,
@@ -740,8 +764,9 @@ with st.sidebar:
                 value=st.session_state.openai_crop_16_9,
                 key="openai_crop_16_9",
                 help=(
-                    "OpenAI は最大 1536×1024 (3:2) までなので、生成後に"
-                    "中央クロップして 1536×864 (16:9) に整える"
+                    "3:2 など 16:9 でないサイズを生成した場合に、中央"
+                    "クロップで 16:9 に整える。1920x1080 のような 16:9 "
+                    "ネイティブサイズでは何もしない"
                 ),
             )
 
