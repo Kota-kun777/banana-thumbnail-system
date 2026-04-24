@@ -227,69 +227,120 @@ if "generating" not in st.session_state:
 
 # 過去のプロンプト初期化
 # 永続化戦略:
-#   1. ブラウザのlocalStorage を主ストレージとする（Streamlit Cloud再起動に強い）
-#   2. サーバー側JSONファイルをフォールバックとする（初回アクセス時・LS無効時）
-#   3. 保存時は両方に書き込む
+#   - ブラウザの localStorage を主ストレージにする（Streamlit Cloud のコンテナ再起動で
+#     サーバー側ファイルが git の状態に戻ってしまっても、ブラウザには履歴が残る）
+#   - サーバー側 JSON はフォールバック（LS無効時・別ブラウザからの初回アクセス時）
+#   - LS 取得は非同期（初回 None → 次リランで値）。毎リラン取得を試みて、値が
+#     取れたタイミングで session_state にマージする
 past_prompts_file = Path(__file__).parent / "past_prompts.json"
 
-# LocalStorage インスタンスの初期化（可能であれば）
+# LocalStorage インスタンス
 _ls_instance = LocalStorage() if _LS_AVAILABLE else None
 _LS_KEY = "banana_past_prompts"
 
+
+def _normalize_prompts(data):
+    """list[str] に正規化。不正な形式は空リストに。"""
+    if not isinstance(data, list):
+        return []
+    return [x for x in data if isinstance(x, str) and x.strip()]
+
+
 def _load_prompts_from_ls():
-    """localStorage から past_prompts を読み出す。失敗時は None を返す。"""
+    """localStorage から past_prompts を読み出す。未取得／失敗時は None。"""
     if _ls_instance is None:
         return None
     try:
         raw = _ls_instance.getItem(_LS_KEY)
-        if raw is None:
-            return None
-        # コンポーネントは str / list / dict を返す可能性があるため両対応
-        if isinstance(raw, str):
-            return json.loads(raw)
-        if isinstance(raw, list):
-            return raw
-        return None
     except Exception:
         return None
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        return _normalize_prompts(parsed)
+    if isinstance(raw, list):
+        return _normalize_prompts(raw)
+    return None
+
 
 def _load_prompts_from_file():
     """サーバー側JSONファイルから past_prompts を読み出す。"""
-    if past_prompts_file.exists():
-        try:
-            with open(past_prompts_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    if not past_prompts_file.exists():
+        return []
+    try:
+        with open(past_prompts_file, "r", encoding="utf-8") as f:
+            return _normalize_prompts(json.load(f))
+    except Exception:
+        return []
+
+
+def _merge_prompts(*lists):
+    """複数のプロンプトリストを順序・重複考慮でマージ（先頭優先）、最大50件。"""
+    seen = set()
+    result = []
+    for lst in lists:
+        if not lst:
+            continue
+        for p in lst:
+            if p and p not in seen:
+                seen.add(p)
+                result.append(p)
+    return result[:50]
+
+
+# 毎リラン LS から値を取得（非同期取得の遅延対策のため都度実行）
+_ls_current = _load_prompts_from_ls()
 
 if "past_prompts" not in st.session_state:
-    # localStorage優先で読み込み、無ければファイルにフォールバック
-    ls_data = _load_prompts_from_ls()
-    if ls_data:
-        st.session_state.past_prompts = ls_data
+    # 初回ハイドレーション: LS が取れていればそれを優先、なければファイルから
+    if _ls_current:
+        st.session_state.past_prompts = list(_ls_current)
+        st.session_state["_ls_hydrated"] = True
     else:
         st.session_state.past_prompts = _load_prompts_from_file()
+        st.session_state["_ls_hydrated"] = False
+else:
+    # 既にセッションに履歴がある状態で、LS から初めて値が取れたときにマージ
+    # （初回 None → 次リランで値 というLSの非同期取得を確実に拾うため）
+    if _ls_current and not st.session_state.get("_ls_hydrated", False):
+        st.session_state.past_prompts = _merge_prompts(
+            _ls_current, st.session_state.past_prompts
+        )
+        st.session_state["_ls_hydrated"] = True
+
 
 def save_prompt(new_prompt):
-    if new_prompt and new_prompt not in st.session_state.past_prompts:
-        st.session_state.past_prompts.insert(0, new_prompt)
-        st.session_state.past_prompts = st.session_state.past_prompts[:50]
-        # localStorage に保存（永続）
-        if _ls_instance is not None:
-            try:
-                _ls_instance.setItem(
-                    _LS_KEY,
-                    json.dumps(st.session_state.past_prompts, ensure_ascii=False),
-                )
-            except Exception:
-                pass  # LS書き込み失敗はサイレントに無視
-        # サーバー側ファイルにもバックアップ保存（コンテナ存命中のみ有効）
+    """プロンプトを履歴の先頭に追加し、LS／ファイル両方へ保存する。"""
+    if not new_prompt:
+        return
+    # 保存直前に LS の最新値を取り込み（別タブ等の並行書き込み対策）
+    ls_latest = _load_prompts_from_ls()
+    base = _merge_prompts(st.session_state.past_prompts, ls_latest or [])
+    # 新規プロンプトを先頭に移動（重複回避）
+    if new_prompt in base:
+        base.remove(new_prompt)
+    base.insert(0, new_prompt)
+    st.session_state.past_prompts = base[:50]
+
+    # localStorage に保存（永続）
+    if _ls_instance is not None:
         try:
-            with open(past_prompts_file, "w", encoding="utf-8") as f:
-                json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
+            _ls_instance.setItem(
+                _LS_KEY,
+                json.dumps(st.session_state.past_prompts, ensure_ascii=False),
+            )
         except Exception:
-            pass  # 読み取り専用FS等でも動くように
+            pass  # LS書き込み失敗はサイレントに無視
+    # サーバー側ファイルにもバックアップ保存（コンテナ存命中のみ有効）
+    try:
+        with open(past_prompts_file, "w", encoding="utf-8") as f:
+            json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # 読み取り専用FS等でも動くように
 
 # 出力ディレクトリ
 output_dir = Path(__file__).parent / "replica_output"
@@ -526,6 +577,55 @@ with st.sidebar:
                 args=(past_prompt,),
                 use_container_width=True,
             )
+
+    # プロンプト履歴のバックアップ・復元（万一 LS もファイルも失われた際の保険）
+    st.markdown("---")
+    with st.expander("🗃️ 履歴のバックアップ／復元"):
+        ls_cnt = len(_ls_current) if _ls_current else 0
+        file_cnt = len(_load_prompts_from_file())
+        ss_cnt = len(st.session_state.past_prompts)
+        st.caption(
+            f"ブラウザ保存: {ls_cnt} 件 ／ サーバー保存: {file_cnt} 件 ／ 表示中: {ss_cnt} 件"
+        )
+        if ss_cnt > 0:
+            st.download_button(
+                "💾 履歴をJSONでダウンロード",
+                data=json.dumps(
+                    st.session_state.past_prompts, ensure_ascii=False, indent=2
+                ),
+                file_name=f"banana_prompts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        restored_file = st.file_uploader(
+            "📥 履歴JSONをアップロードして復元",
+            type=["json"],
+            key="history_uploader",
+        )
+        if restored_file is not None:
+            try:
+                imported = _normalize_prompts(json.load(restored_file))
+                if imported:
+                    merged = _merge_prompts(imported, st.session_state.past_prompts)
+                    st.session_state.past_prompts = merged
+                    if _ls_instance is not None:
+                        try:
+                            _ls_instance.setItem(
+                                _LS_KEY,
+                                json.dumps(merged, ensure_ascii=False),
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        with open(past_prompts_file, "w", encoding="utf-8") as f:
+                            json.dump(merged, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                    st.success(f"{len(merged)} 件に復元しました")
+                else:
+                    st.error("JSONの形式が正しくありません（文字列の配列が必要）")
+            except Exception as e:
+                st.error(f"読み込みに失敗しました: {e}")
 
     # ギャラリー状況の表示
     st.markdown("---")
