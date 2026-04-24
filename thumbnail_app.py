@@ -114,7 +114,34 @@ def _generate_one_gemini(api_key, prompt, image_bytes_list):
     return None, "画像データなし"
 
 
-def _generate_one_openai(api_key, prompt, image_bytes_list, model, size, quality):
+def _crop_to_16_9(img_bytes):
+    """画像を中央クロップで 16:9 に整える。失敗時は元のまま返す。"""
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        w, h = img.size
+        target = 16 / 9
+        current = w / h
+        if abs(current - target) < 0.01:
+            return img_bytes  # 既に16:9
+        if current > target:
+            # 横に広すぎ → 左右を切る
+            new_w = int(round(h * target))
+            left = (w - new_w) // 2
+            cropped = img.crop((left, 0, left + new_w, h))
+        else:
+            # 縦に長い → 上下を切る（1536x1024 → 1536x864 など）
+            new_h = int(round(w / target))
+            top = (h - new_h) // 2
+            cropped = img.crop((0, top, w, top + new_h))
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def _generate_one_openai(api_key, prompt, image_bytes_list, model, size, quality,
+                          crop_16_9=True):
     """OpenAI Images 2.0 で画像を1枚生成。成功: (bytes, None) / 失敗: (None, 理由)"""
     if not _OPENAI_AVAILABLE:
         return None, "openai パッケージが未インストール"
@@ -141,20 +168,28 @@ def _generate_one_openai(api_key, prompt, image_bytes_list, model, size, quality
         result = client.images.generate(**kwargs)
 
     data = result.data[0]
+    raw = None
     if getattr(data, "b64_json", None):
-        return base64.b64decode(data.b64_json), None
-    if getattr(data, "url", None):
+        raw = base64.b64decode(data.b64_json)
+    elif getattr(data, "url", None):
         import urllib.request
         with urllib.request.urlopen(data.url) as resp:
-            return resp.read(), None
-    return None, "画像データなし"
+            raw = resp.read()
+
+    if raw is None:
+        return None, "画像データなし"
+
+    if crop_16_9:
+        raw = _crop_to_16_9(raw)
+    return raw, None
 
 
 def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                       num_to_generate, output_dir, timestamp, start_num,
                       openai_model=OPENAI_IMAGE_MODEL_DEFAULT,
                       openai_size="1536x1024",
-                      openai_quality="high"):
+                      openai_quality="high",
+                      openai_crop_16_9=True):
     """バックグラウンドスレッドで画像を生成するワーカー関数"""
     state = get_gen_state(session_id)
     MAX_RETRIES = 3
@@ -187,6 +222,7 @@ def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                         img_bytes, err = _generate_one_openai(
                             api_key, prompt, image_bytes_list,
                             openai_model, openai_size, openai_quality,
+                            crop_16_9=openai_crop_16_9,
                         )
                     else:
                         img_bytes, err = _generate_one_gemini(
@@ -316,6 +352,8 @@ if "openai_size" not in st.session_state:
     st.session_state.openai_size = OPENAI_SIZE_OPTIONS[0]
 if "openai_quality" not in st.session_state:
     st.session_state.openai_quality = OPENAI_QUALITY_OPTIONS[0]
+if "openai_crop_16_9" not in st.session_state:
+    st.session_state.openai_crop_16_9 = True
 
 # ギャラリー蓄積用（ボタンを押すたびに追加、最大50枚）
 if "gallery_images" not in st.session_state:
@@ -697,6 +735,15 @@ with st.sidebar:
                 else 0,
                 key="openai_quality",
             )
+            st.checkbox(
+                "16:9 にクロップ（YouTube向け）",
+                value=st.session_state.openai_crop_16_9,
+                key="openai_crop_16_9",
+                help=(
+                    "OpenAI は最大 1536×1024 (3:2) までなので、生成後に"
+                    "中央クロップして 1536×864 (16:9) に整える"
+                ),
+            )
 
     st.header("👤 キャラクター設定")
     illustration_mode = st.radio(
@@ -961,6 +1008,7 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
             st.session_state.openai_model,
             st.session_state.openai_size,
             st.session_state.openai_quality,
+            st.session_state.openai_crop_16_9,
         ),
         daemon=True,
     )
