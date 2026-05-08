@@ -466,7 +466,19 @@ else:
 
 
 def save_prompt(new_prompt):
-    """プロンプトを履歴の先頭に追加し、LS／ファイル両方へ保存する。"""
+    """プロンプトを履歴の先頭に追加し、ファイル／LS 両方へ保存する。
+
+    🚨 2026-05-09 改: 順序を「ファイル → LS」 に逆転 (旧: LS → ファイル)
+    旧版は LS write (streamlit_local_storage.setItem) が稀に rerun 例外を投げて、
+    後続のファイル write がスキップされる事象が発生していた。
+    ファイル mtime が 2/28 で固定されており、 ブラウザ LS が消えると新プロンプトが
+    全て失われていた (社長 5/9 報告)。
+
+    対策:
+      1. ファイル書込みを最優先 (アトミック: temp + rename で破損も防止)
+      2. ファイル書込みが失敗したら stderr にログ出力 (silent fail 排除)
+      3. LS 書込みは最後 (失敗しても最低限ファイルは生きている)
+    """
     if not new_prompt:
         return
     # 保存直前に LS の最新値を取り込み（別タブ等の並行書き込み対策）
@@ -478,21 +490,35 @@ def save_prompt(new_prompt):
     base.insert(0, new_prompt)
     st.session_state.past_prompts = base[:50]
 
-    # localStorage に保存（永続）
+    # ① サーバー側ファイル — 永続性最優先 (アトミック書込み)
+    try:
+        tmp_path = past_prompts_file.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
+        # rename で原子的置換 (途中クラッシュでも本体は破損しない)
+        os.replace(tmp_path, past_prompts_file)
+    except Exception as e:
+        import sys
+        print(
+            f"[save_prompt] ❌ ファイル書込み失敗: {type(e).__name__}: {e} "
+            f"(path={past_prompts_file})",
+            file=sys.stderr,
+        )
+
+    # ② localStorage — ブラウザ便宜上の二次保存 (失敗してもファイルが残る)
     if _ls_instance is not None:
         try:
             _ls_instance.setItem(
                 _LS_KEY,
                 json.dumps(st.session_state.past_prompts, ensure_ascii=False),
             )
-        except Exception:
-            pass  # LS書き込み失敗はサイレントに無視
-    # サーバー側ファイルにもバックアップ保存（コンテナ存命中のみ有効）
-    try:
-        with open(past_prompts_file, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.past_prompts, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass  # 読み取り専用FS等でも動くように
+        except Exception as e:
+            import sys
+            print(
+                f"[save_prompt] ⚠️ LocalStorage 書込み失敗 (ファイルは保存済): "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
 # 出力ディレクトリ
 output_dir = Path(__file__).parent / "replica_output"
