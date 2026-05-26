@@ -390,6 +390,103 @@ past_prompts_file = Path(__file__).parent / "past_prompts.json"
 _ls_instance = LocalStorage() if _LS_AVAILABLE else None
 _LS_KEY = "banana_past_prompts"
 
+# 🆕 2026-05-26: GitHub Gist 同期 (= デバイス横断の永続化・真の解決策)
+# 真因: localStorage はブラウザ × デバイス単位のため デスクトップ PC と Mac で別 LS
+#       → 別デバイスから見ると履歴が「消えた」ように見える
+# 対策: GitHub Gist を 真の真実の源 (= source of truth) として 全デバイスから 同じ履歴 を参照
+# 設定: Streamlit Secrets に github_token (= PAT, gist scope) と gist_id を 登録
+_GIST_FILENAME = "banana_past_prompts.json"
+
+
+def _get_gist_config():
+    """Streamlit Secrets から GitHub Gist 設定を取得 (= 未設定なら None)。"""
+    try:
+        token = st.secrets.get("github_token", "")
+        gist_id = st.secrets.get("gist_id", "")
+        if token and gist_id:
+            return {"token": token.strip(), "gist_id": gist_id.strip()}
+    except Exception:
+        pass
+    return None
+
+
+def _load_prompts_from_gist():
+    """GitHub Gist から past_prompts を読み出す (= デバイス横断の真の保存先)。
+    未設定 / 失敗時は None。 5 秒タイムアウト で UI ブロック回避。
+    """
+    cfg = _get_gist_config()
+    if not cfg:
+        return None
+    try:
+        import urllib.request
+        import urllib.error
+        url = f"https://api.github.com/gists/{cfg['gist_id']}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {cfg['token']}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "banana-thumbnail-sync",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        files = data.get("files") or {}
+        target = files.get(_GIST_FILENAME)
+        if not target:
+            return []  # Gist は存在するがファイルなし = 初回
+        content = target.get("content", "")
+        if not content:
+            return []
+        try:
+            parsed = json.loads(content)
+            return _normalize_prompts(parsed)
+        except Exception:
+            return None
+    except Exception as e:
+        import sys
+        print(f"[gist_load] ⚠️ Gist 取得失敗 (LS/ファイルで継続): {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None
+
+
+def _save_prompts_to_gist(prompts_list):
+    """GitHub Gist に past_prompts を保存 (= デバイス横断同期)。
+    未設定 / 失敗時は何もしない (= LS+ファイル保存は別途実施済)。
+    """
+    cfg = _get_gist_config()
+    if not cfg:
+        return False
+    try:
+        import urllib.request
+        url = f"https://api.github.com/gists/{cfg['gist_id']}"
+        payload = json.dumps({
+            "files": {
+                _GIST_FILENAME: {
+                    "content": json.dumps(prompts_list, ensure_ascii=False, indent=2)
+                }
+            }
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="PATCH",
+            headers={
+                "Authorization": f"Bearer {cfg['token']}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "banana-thumbnail-sync",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()  # 応答消化のみ
+        return True
+    except Exception as e:
+        import sys
+        print(f"[gist_save] ⚠️ Gist 書込み失敗 (LS+ファイルは保存済): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return False
+
 
 def _normalize_prompts(data):
     """list[str] に正規化。不正な形式は空リストに。"""
@@ -447,14 +544,27 @@ def _merge_prompts(*lists):
 # 毎リラン LS から値を取得（非同期取得の遅延対策のため都度実行）
 _ls_current = _load_prompts_from_ls()
 
+# 🆕 Gist は初回セッション開始時のみ 取得 (= ネットワーク IO 抑制・session_state でキャッシュ)
+if "_gist_loaded" not in st.session_state:
+    _gist_current = _load_prompts_from_gist()
+    st.session_state["_gist_loaded"] = True
+    st.session_state["_gist_cached"] = _gist_current  # None なら未設定 or 取得失敗
+else:
+    _gist_current = st.session_state.get("_gist_cached")
+
 if "past_prompts" not in st.session_state:
-    # 初回ハイドレーション: LS が取れていればそれを優先、なければファイルから
+    # 初回ハイドレーション: Gist > LS > ファイル の優先順 + 全マージ
+    # 真の真実の源 = Gist なので最優先・LS とファイルは ローカルに 何かあれば 拾う
+    sources = []
+    if _gist_current is not None:
+        sources.append(_gist_current)
     if _ls_current:
-        st.session_state.past_prompts = list(_ls_current)
-        st.session_state["_ls_hydrated"] = True
-    else:
-        st.session_state.past_prompts = _load_prompts_from_file()
-        st.session_state["_ls_hydrated"] = False
+        sources.append(_ls_current)
+    file_loaded = _load_prompts_from_file()
+    if file_loaded:
+        sources.append(file_loaded)
+    st.session_state.past_prompts = _merge_prompts(*sources)
+    st.session_state["_ls_hydrated"] = bool(_ls_current or _gist_current)
 else:
     # 既にセッションに履歴がある状態で、LS から初めて値が取れたときにマージ
     # （初回 None → 次リランで値 というLSの非同期取得を確実に拾うため）
@@ -519,6 +629,10 @@ def save_prompt(new_prompt):
                 f"{type(e).__name__}: {e}",
                 file=sys.stderr,
             )
+
+    # ③ 🆕 GitHub Gist — デバイス横断同期 (= 真の真実の源)
+    # 失敗してもファイル+LSが保存済のため UI ブロックしない・5秒タイムアウト内蔵
+    _save_prompts_to_gist(st.session_state.past_prompts)
 
 # 出力ディレクトリ
 output_dir = Path(__file__).parent / "replica_output"
@@ -845,6 +959,43 @@ with st.sidebar:
         ls_cnt = len(_ls_current) if _ls_current else 0
         file_cnt = len(_load_prompts_from_file())
         ss_cnt = len(st.session_state.past_prompts)
+
+        # 🆕 Gist 同期ステータス表示
+        _gist_cfg = _get_gist_config()
+        _gist_cached = st.session_state.get("_gist_cached")
+        if _gist_cfg is None:
+            st.warning(
+                "☁️ **Gist 同期: 未設定** "
+                "(デバイス横断永続化を有効にするには Streamlit Secrets に "
+                "`github_token` (PAT, gist scope) と `gist_id` を登録してください)"
+            )
+        elif _gist_cached is None:
+            st.error(
+                "☁️ **Gist 同期: エラー** (取得失敗・LS/ファイルで継続中。 "
+                "PAT 権限 / GIST_ID を確認してください)"
+            )
+        else:
+            st.success(f"☁️ **Gist 同期: 有効** (Gist 保存: {len(_gist_cached)} 件)")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("🔄 Gist から再取得", use_container_width=True):
+                    fresh = _load_prompts_from_gist()
+                    if fresh is not None:
+                        st.session_state["_gist_cached"] = fresh
+                        st.session_state.past_prompts = _merge_prompts(
+                            fresh, st.session_state.past_prompts
+                        )
+                        st.success(f"✅ {len(fresh)} 件を再取得")
+                        st.rerun()
+                    else:
+                        st.error("再取得失敗")
+            with col_b:
+                if st.button("☁️ Gist へ手動 push", use_container_width=True):
+                    if _save_prompts_to_gist(st.session_state.past_prompts):
+                        st.success("✅ Gist 更新成功")
+                    else:
+                        st.error("Gist 更新失敗")
+
         st.caption(
             f"ブラウザ保存: {ls_cnt} 件 ／ サーバー保存: {file_cnt} 件 ／ 表示中: {ss_cnt} 件"
         )
