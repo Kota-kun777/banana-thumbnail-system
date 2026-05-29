@@ -5,6 +5,7 @@ import time
 import base64
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from datetime import datetime
 from pathlib import Path
@@ -192,89 +193,118 @@ def _generate_one_openai(api_key, prompt, image_bytes_list, model, size, quality
     return raw, None
 
 
+def _generate_image_task(state, i, num_to_generate, provider, api_key, prompt,
+                         image_bytes_list, output_dir, timestamp, start_num,
+                         openai_model, openai_size, openai_quality, openai_crop_16_9):
+    """画像を1枚生成する（リトライ込み）。ThreadPoolExecutor で並列実行される。"""
+    MAX_RETRIES = 3
+    if state.stop_requested:
+        return
+
+    img_num = start_num + i
+    filename = f"replica_{timestamp}_{img_num:02d}.png"
+    filepath = output_dir / filename
+
+    for attempt in range(MAX_RETRIES):
+        if state.stop_requested:
+            return
+
+        try:
+            if provider == "openai":
+                img_bytes, err = _generate_one_openai(
+                    api_key, prompt, image_bytes_list,
+                    openai_model, openai_size, openai_quality,
+                    crop_16_9=openai_crop_16_9,
+                )
+            else:
+                img_bytes, err = _generate_one_gemini(
+                    api_key, prompt, image_bytes_list,
+                )
+
+            if img_bytes is not None:
+                with open(filepath, "wb") as f:
+                    f.write(img_bytes)
+                with state.lock:
+                    state.images.append(str(filepath))
+                    state.success_count += 1
+                return  # 成功
+
+            # エンジンが失敗理由を返した
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            with state.lock:
+                state.errors.append(f"画像 {img_num}: {err}")
+            return
+
+        except Exception as e:
+            err_str = str(e)
+            # レート制限 or 一時エラーはリトライ
+            is_rate_limit = (
+                "429" in err_str
+                or "RESOURCE_EXHAUSTED" in err_str
+                or "rate_limit" in err_str.lower()
+            )
+            if attempt < MAX_RETRIES - 1 and is_rate_limit:
+                time.sleep(5 * (attempt + 1))
+                continue
+            with state.lock:
+                state.errors.append(f"画像 {img_num}: {err_str[:200]}")
+            return
+
+
 def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                       num_to_generate, output_dir, timestamp, start_num,
                       openai_model=OPENAI_IMAGE_MODEL_DEFAULT,
                       openai_size="1536x1024",
                       openai_quality="high",
-                      openai_crop_16_9=True):
-    """バックグラウンドスレッドで画像を生成するワーカー関数"""
+                      openai_crop_16_9=True,
+                      max_workers=5):
+    """バックグラウンドスレッドで画像を並列生成するワーカー関数。
+
+    各画像を ThreadPoolExecutor のタスクとして同時実行する。
+    max_workers で同時実行数を制御（既定5）。API のレート制限に当たった場合は
+    各タスク内のリトライ＋指数バックオフが自動で吸収する。
+    """
     state = get_gen_state(session_id)
-    MAX_RETRIES = 3
+    engine_label = "OpenAI" if provider == "openai" else "Gemini"
+    # 生成枚数より多いワーカーは無駄なので上限を絞る（最低1）
+    workers = max(1, min(max_workers, num_to_generate))
 
     try:
-        for i in range(num_to_generate):
-            if state.stop_requested:
+        with state.lock:
+            state.status = (
+                f"[{engine_label}] 並列生成中（最大 {workers} 枚同時）"
+                f" — 完了 0/{num_to_generate}"
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    _generate_image_task, state, i, num_to_generate, provider,
+                    api_key, prompt, image_bytes_list, output_dir, timestamp,
+                    start_num, openai_model, openai_size, openai_quality,
+                    openai_crop_16_9,
+                )
+                for i in range(num_to_generate)
+            ]
+            for _ in as_completed(futures):
                 with state.lock:
-                    state.status = f"⏹️ ユーザーにより停止（{state.success_count}枚生成済み）"
-                break
-
-            img_num = start_num + i
-            filename = f"replica_{timestamp}_{img_num:02d}.png"
-            filepath = output_dir / filename
-
-            for attempt in range(MAX_RETRIES):
-                if state.stop_requested:
-                    break
-
-                retry_label = f"（リトライ {attempt + 1}/{MAX_RETRIES}）" if attempt > 0 else ""
-                engine_label = "OpenAI" if provider == "openai" else "Gemini"
-                with state.lock:
-                    state.status = (
-                        f"[{engine_label}] 生成中 [{i + 1}/{num_to_generate}] "
-                        f"...（合計 {img_num} 枚目）{retry_label}"
-                    )
-
-                try:
-                    if provider == "openai":
-                        img_bytes, err = _generate_one_openai(
-                            api_key, prompt, image_bytes_list,
-                            openai_model, openai_size, openai_quality,
-                            crop_16_9=openai_crop_16_9,
+                    state.completed += 1
+                    if state.stop_requested:
+                        state.status = (
+                            f"⏹️ 停止処理中...（{state.success_count}枚生成済み）"
                         )
                     else:
-                        img_bytes, err = _generate_one_gemini(
-                            api_key, prompt, image_bytes_list,
+                        state.status = (
+                            f"[{engine_label}] 並列生成中（最大 {workers} 枚同時）"
+                            f" — 完了 {state.completed}/{num_to_generate}"
+                            f"・成功 {state.success_count}"
                         )
 
-                    if img_bytes is not None:
-                        with open(filepath, "wb") as f:
-                            f.write(img_bytes)
-                        with state.lock:
-                            state.images.append(str(filepath))
-                            state.success_count += 1
-                        break  # 成功 → 次の画像へ
-
-                    # エンジンが失敗理由を返した
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(2 * (attempt + 1))
-                        continue
-                    with state.lock:
-                        state.errors.append(f"画像 {img_num}: {err}")
-                    break
-
-                except Exception as e:
-                    err_str = str(e)
-                    # レート制限 or 一時エラーはリトライ
-                    is_rate_limit = (
-                        "429" in err_str
-                        or "RESOURCE_EXHAUSTED" in err_str
-                        or "rate_limit" in err_str.lower()
-                    )
-                    if attempt < MAX_RETRIES - 1 and is_rate_limit:
-                        with state.lock:
-                            state.status = (
-                                f"⏳ レート制限のため待機中... "
-                                f"[{i + 1}/{num_to_generate}]（{attempt + 1}回目）"
-                            )
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                    with state.lock:
-                        state.errors.append(f"画像 {img_num}: {err_str[:200]}")
-                    break
-
+        if state.stop_requested:
             with state.lock:
-                state.completed = i + 1
+                state.status = f"⏹️ ユーザーにより停止（{state.success_count}枚生成済み）"
 
     finally:
         with state.lock:
@@ -362,6 +392,8 @@ if "openai_quality" not in st.session_state:
     st.session_state.openai_quality = OPENAI_QUALITY_OPTIONS[0]
 if "openai_crop_16_9" not in st.session_state:
     st.session_state.openai_crop_16_9 = True
+if "concurrency" not in st.session_state:
+    st.session_state.concurrency = 5  # 同時生成数（既定5・Geminiなら無料/有料枠とも余裕でセーフ）
 
 # ギャラリー蓄積用（ボタンを押すたびに追加、最大50枚）
 if "gallery_images" not in st.session_state:
@@ -824,6 +856,22 @@ with st.sidebar:
     provider_key = "gemini" if "Gemini" in provider_display else "openai"
     st.session_state.provider_key = provider_key
 
+    # --- 同時生成数（並列化） ---
+    st.slider(
+        "⚡ 同時生成数",
+        min_value=1,
+        max_value=10,
+        value=st.session_state.concurrency,
+        key="concurrency",
+        help=(
+            "複数の画像を同時に生成して高速化する。\n"
+            "Gemini: 5 でも無料/有料枠ともに余裕（推奨）。\n"
+            "OpenAI: 低Tier（Tier1=5枚/分）では大きくすると一時的に"
+            "レート制限に当たる場合あり（自動リトライで吸収）。\n"
+            "1 にすると従来通り1枚ずつ順番に生成。"
+        ),
+    )
+
     # --- 選択モデルの APIキー状態 ---
     gemini_from_secrets = bool(_get_secret("GEMINI_API_KEY"))
     openai_from_secrets = bool(_get_secret("OPENAI_API_KEY"))
@@ -1209,6 +1257,7 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
             st.session_state.openai_size,
             st.session_state.openai_quality,
             st.session_state.openai_crop_16_9,
+            st.session_state.concurrency,
         ),
         daemon=True,
     )
