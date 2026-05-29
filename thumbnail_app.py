@@ -53,6 +53,10 @@ OPENAI_SIZE_OPTIONS = [
 ]
 OPENAI_QUALITY_OPTIONS = ["high", "medium", "low", "auto"]
 
+# ギャラリーに蓄積できる最大枚数（この枚数に達するとリセットが必要になる）。
+# 大きくしすぎると Streamlit Cloud のメモリ／表示が重くなる点だけ注意。
+MAX_GALLERY = 200
+
 # ページ設定
 st.set_page_config(page_title="Banana Replica UI", page_icon="🍌", layout="wide")
 
@@ -395,7 +399,7 @@ if "openai_crop_16_9" not in st.session_state:
 if "concurrency" not in st.session_state:
     st.session_state.concurrency = 5  # 同時生成数（既定5・Geminiなら無料/有料枠とも余裕でセーフ）
 
-# ギャラリー蓄積用（ボタンを押すたびに追加、最大50枚）
+# ギャラリー蓄積用（ボタンを押すたびに追加、最大 MAX_GALLERY 枚）
 if "gallery_images" not in st.session_state:
     st.session_state.gallery_images = []
 
@@ -860,14 +864,15 @@ with st.sidebar:
     st.slider(
         "⚡ 同時生成数",
         min_value=1,
-        max_value=10,
+        max_value=20,
         value=st.session_state.concurrency,
         key="concurrency",
         help=(
             "複数の画像を同時に生成して高速化する。\n"
-            "Gemini: 5 でも無料/有料枠ともに余裕（推奨）。\n"
-            "OpenAI: 低Tier（Tier1=5枚/分）では大きくすると一時的に"
-            "レート制限に当たる場合あり（自動リトライで吸収）。\n"
+            "Gemini: 有料Tier1は150〜300 RPM なので 10〜20 でも基本OK"
+            "（時間帯やプレビュー枠の混雑で一時的に429が出ても自動リトライで吸収）。\n"
+            "OpenAI: 低Tier（Tier1=5枚/分）では大きくするとレート制限に"
+            "当たりやすい（自動リトライで吸収するが速度は頭打ち）。\n"
             "1 にすると従来通り1枚ずつ順番に生成。"
         ),
     )
@@ -1090,7 +1095,7 @@ with st.sidebar:
     # ギャラリー状況の表示
     st.markdown("---")
     gallery_count = len(st.session_state.gallery_images)
-    st.markdown(f"**📊 現在のギャラリー: {gallery_count} / 50 枚**")
+    st.markdown(f"**📊 現在のギャラリー: {gallery_count} / {MAX_GALLERY} 枚**")
     if gallery_count > 0:
         if st.button("🔄 ギャラリーをリセット（新しく始める）", use_container_width=True):
             st.session_state.gallery_images = []
@@ -1145,7 +1150,7 @@ if st.session_state.past_prompts:
 
 # 生成枚数の選択（on_clickコールバックで更新 → プロンプトが消えない）
 gallery_count = len(st.session_state.gallery_images)
-remaining = 50 - gallery_count
+remaining = MAX_GALLERY - gallery_count
 is_max = remaining <= 0
 
 st.markdown("**🔢 生成枚数:**")
@@ -1166,13 +1171,13 @@ chosen_count = st.session_state.gen_count
 
 # ボタンラベル
 if is_max:
-    btn_label = "🚫 最大50枚に達しました（リセットしてください）"
+    btn_label = f"🚫 最大{MAX_GALLERY}枚に達しました（リセットしてください）"
 elif st.session_state.generating:
     btn_label = "⏳ 生成中..."
 elif gallery_count == 0:
     btn_label = f"✨ 画像を生成する（{chosen_count}枚）"
 else:
-    target = min(gallery_count + chosen_count, 50)
+    target = min(gallery_count + chosen_count, MAX_GALLERY)
     btn_label = f"✨ さらに{chosen_count}枚追加生成する（現在 {gallery_count} 枚 → {target} 枚）"
 
 # 入力フォーム
@@ -1209,8 +1214,8 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
             st.error("左のサイドバーから Gemini API Key を設定してください。")
             st.stop()
 
-    # 今回生成する枚数（選択した枚数、ただし上限50枚を超えない）
-    num_to_generate = min(st.session_state.gen_count, 50 - len(st.session_state.gallery_images))
+    # 今回生成する枚数（選択した枚数、ただし上限 MAX_GALLERY 枚を超えない）
+    num_to_generate = min(st.session_state.gen_count, MAX_GALLERY - len(st.session_state.gallery_images))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     start_num = len(st.session_state.gallery_images) + 1
 
