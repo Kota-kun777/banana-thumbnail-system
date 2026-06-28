@@ -56,6 +56,10 @@ OPENAI_QUALITY_OPTIONS = ["high", "medium", "low", "auto"]
 # ギャラリーに蓄積できる最大枚数（この枚数に達するとリセットが必要になる）。
 # 大きくしすぎると Streamlit Cloud のメモリ／表示が重くなる点だけ注意。
 MAX_GALLERY = 200
+DEFAULT_GENERATION_COUNT = 10
+DEFAULT_CONCURRENCY = 10
+DEFAULTS_VERSION = 20260628
+ILLUSTRATION_MODE_KEY = f"illustration_mode_{DEFAULTS_VERSION}"
 
 # ページ設定
 st.set_page_config(page_title="Banana Replica UI", page_icon="🍌", layout="wide")
@@ -263,11 +267,11 @@ def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                       openai_size="1536x1024",
                       openai_quality="high",
                       openai_crop_16_9=True,
-                      max_workers=5):
+                      max_workers=DEFAULT_CONCURRENCY):
     """バックグラウンドスレッドで画像を並列生成するワーカー関数。
 
     各画像を ThreadPoolExecutor のタスクとして同時実行する。
-    max_workers で同時実行数を制御（既定5）。API のレート制限に当たった場合は
+    max_workers で同時実行数を制御（既定10）。API のレート制限に当たった場合は
     各タスク内のリトライ＋指数バックオフが自動で吸収する。
     """
     state = get_gen_state(session_id)
@@ -397,7 +401,7 @@ if "openai_quality" not in st.session_state:
 if "openai_crop_16_9" not in st.session_state:
     st.session_state.openai_crop_16_9 = True
 if "concurrency" not in st.session_state:
-    st.session_state.concurrency = 5  # 同時生成数（既定5・Geminiなら無料/有料枠とも余裕でセーフ）
+    st.session_state.concurrency = DEFAULT_CONCURRENCY
 
 # ギャラリー蓄積用（ボタンを押すたびに追加、最大 MAX_GALLERY 枚）
 if "gallery_images" not in st.session_state:
@@ -683,7 +687,15 @@ def set_prompt(text):
 
 # 生成枚数の選択用コールバック
 if "gen_count" not in st.session_state:
-    st.session_state.gen_count = 5
+    st.session_state.gen_count = DEFAULT_GENERATION_COUNT
+
+# Migrate already-open Streamlit sessions from the old 5-image defaults once.
+if st.session_state.get("_thumbnail_defaults_version") != DEFAULTS_VERSION:
+    if st.session_state.get("concurrency", 5) == 5:
+        st.session_state.concurrency = DEFAULT_CONCURRENCY
+    if st.session_state.get("gen_count", 5) == 5:
+        st.session_state.gen_count = DEFAULT_GENERATION_COUNT
+    st.session_state._thumbnail_defaults_version = DEFAULTS_VERSION
 
 def set_gen_count(count):
     st.session_state.gen_count = count
@@ -964,13 +976,15 @@ with st.sidebar:
     st.header("👤 キャラクター設定")
     illustration_mode = st.radio(
         "すあし社長のイラスト",
-        options=["焦っている（固定）", "通常", "含めない"],
+        options=["焦っている（固定）", "グッド（固定）", "通常", "含めない"],
         index=0,  # デフォルトは「焦っている（固定）」
-        key="illustration_mode",
+        key=ILLUSTRATION_MODE_KEY,
     )
     # 選択に応じた画像ファイルのパスを決定
     if illustration_mode == "通常":
         ill_path = Path(__file__).parent / "illustration.png"
+    elif illustration_mode == "グッド（固定）":
+        ill_path = Path(__file__).parent / "illustration_good.png"
     elif illustration_mode == "焦っている（固定）":
         ill_path = Path(__file__).parent / "illustration_panic.png"
     else:
@@ -1222,9 +1236,11 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
     # 参考画像のバイト列を収集（エンジンに依存しない形で渡す）
     image_bytes_list = []
 
-    selected_mode = st.session_state.get("illustration_mode", "焦っている（固定）")
+    selected_mode = st.session_state.get(ILLUSTRATION_MODE_KEY, "焦っている（固定）")
     if selected_mode == "通常":
         gen_ill_path = Path(__file__).parent / "illustration.png"
+    elif selected_mode == "グッド（固定）":
+        gen_ill_path = Path(__file__).parent / "illustration_good.png"
     elif selected_mode == "焦っている（固定）":
         gen_ill_path = Path(__file__).parent / "illustration_panic.png"
     else:
