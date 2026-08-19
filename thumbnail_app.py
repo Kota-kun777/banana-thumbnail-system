@@ -679,6 +679,19 @@ def _merge_prompts(*lists):
     return result[:50]
 
 
+def _auto_sync_hydrated_prompts():
+    """LS／サーバーファイルだけにある旧履歴をGistへ一度だけ移行する。"""
+    gist_cached = st.session_state.get("_gist_cached")
+    current = st.session_state.get("past_prompts", [])
+    # None はGist未設定または取得エラー。失敗時は自動書込みしない。
+    if gist_cached is None or not current or current == gist_cached:
+        return
+    saved, merged = _sync_prompts_to_gist(current)
+    if saved:
+        st.session_state.past_prompts = merged
+        st.session_state["_gist_cached"] = list(merged)
+
+
 # 毎リラン LS から値を取得（非同期取得の遅延対策のため都度実行）
 _ls_current = _load_prompts_from_ls()
 
@@ -702,7 +715,9 @@ if "past_prompts" not in st.session_state:
     if file_loaded:
         sources.append(file_loaded)
     st.session_state.past_prompts = _merge_prompts(*sources)
-    st.session_state["_ls_hydrated"] = bool(_ls_current or _gist_current)
+    # Gistが取れたことと、非同期のLS取得が完了したことは別に管理する。
+    st.session_state["_ls_hydrated"] = _ls_current is not None
+    _auto_sync_hydrated_prompts()
 else:
     # 既にセッションに履歴がある状態で、LS から初めて値が取れたときにマージ
     # （初回 None → 次リランで値 というLSの非同期取得を確実に拾うため）
@@ -711,6 +726,7 @@ else:
             _ls_current, st.session_state.past_prompts
         )
         st.session_state["_ls_hydrated"] = True
+        _auto_sync_hydrated_prompts()
 
 
 def save_prompt(new_prompt):
