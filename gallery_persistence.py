@@ -18,6 +18,7 @@ from typing import Iterable
 
 
 MANIFEST_FILENAME = "gallery_manifest.json"
+BATCHES_FILENAME = "generation_batches.json"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _LOCK = threading.RLock()
 
@@ -33,6 +34,10 @@ def normalize_retention_days(value: object, default: int = 7) -> int:
 
 def _manifest_path(output_dir: Path) -> Path:
     return output_dir / MANIFEST_FILENAME
+
+
+def _batches_path(output_dir: Path) -> Path:
+    return output_dir / BATCHES_FILENAME
 
 
 def _safe_image_path(output_dir: Path, name: object) -> Path | None:
@@ -222,9 +227,195 @@ def append_gallery_images(
 
 
 def clear_gallery(output_dir: Path) -> None:
-    """Start a new gallery while leaving files available until retention cleanup."""
+    """Start a new working gallery without deleting generation history."""
     with _LOCK:
         _write_manifest_unlocked(output_dir, [], reset_at=time.time())
+
+
+def _read_batches_unlocked(output_dir: Path) -> list[dict]:
+    path = _batches_path(output_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("batches", [])
+    return data if isinstance(data, list) else []
+
+
+def _write_batches_unlocked(output_dir: Path, batches: list[dict]) -> None:
+    output_dir.mkdir(exist_ok=True, parents=True)
+    path = _batches_path(output_dir)
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(
+            {"version": 1, "batches": batches},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
+
+def _normalize_batches_unlocked(
+    output_dir: Path,
+    raw_batches: Iterable[object],
+    *,
+    cutoff: float,
+    max_batches: int,
+    max_images: int,
+) -> tuple[list[dict], list[dict]]:
+    """Return JSON-safe batches and UI batches containing resolved Paths."""
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
+    for raw in raw_batches:
+        if not isinstance(raw, dict):
+            continue
+        batch_id = str(raw.get("id", "")).strip()
+        prompt = raw.get("prompt", "")
+        provider = str(raw.get("provider", "")).strip() or "unknown"
+        if not batch_id or batch_id in seen_ids or not isinstance(prompt, str):
+            continue
+        try:
+            created_at = float(raw.get("created_at", 0))
+        except (TypeError, ValueError):
+            continue
+        if created_at < cutoff:
+            continue
+
+        paths: list[Path] = []
+        seen_names: set[str] = set()
+        for name in raw.get("images", []):
+            path = _safe_image_path(output_dir, name)
+            if (
+                path is not None
+                and path.name not in seen_names
+                and _is_recent(path, cutoff)
+            ):
+                seen_names.add(path.name)
+                paths.append(path)
+        if not paths:
+            continue
+        seen_ids.add(batch_id)
+        candidates.append(
+            {
+                "id": batch_id,
+                "created_at": created_at,
+                "prompt": prompt,
+                "provider": provider,
+                "images": paths,
+            }
+        )
+
+    candidates.sort(key=lambda batch: (batch["created_at"], batch["id"]), reverse=True)
+    kept: list[dict] = []
+    image_count = 0
+    for batch in candidates:
+        if max_batches > 0 and len(kept) >= max_batches:
+            break
+        remaining = max_images - image_count if max_images > 0 else len(batch["images"])
+        if max_images > 0 and remaining <= 0:
+            break
+        paths = batch["images"][:remaining] if max_images > 0 else batch["images"]
+        if not paths:
+            continue
+        kept.append({**batch, "images": paths})
+        image_count += len(paths)
+
+    serializable = [
+        {
+            "id": batch["id"],
+            "created_at": batch["created_at"],
+            "prompt": batch["prompt"],
+            "provider": batch["provider"],
+            "images": [path.name for path in batch["images"]],
+        }
+        for batch in kept
+    ]
+    return serializable, kept
+
+
+def load_generation_batches(
+    output_dir: Path,
+    *,
+    retention_days: int = 7,
+    max_batches: int = 100,
+    max_images: int = 500,
+) -> list[dict]:
+    """Load recent generation runs, newest first, with prompt snapshots."""
+    retention_days = normalize_retention_days(retention_days)
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    with _LOCK:
+        output_dir.mkdir(exist_ok=True, parents=True)
+        _prune_expired_unlocked(output_dir, cutoff)
+        serializable, batches = _normalize_batches_unlocked(
+            output_dir,
+            _read_batches_unlocked(output_dir),
+            cutoff=cutoff,
+            max_batches=max_batches,
+            max_images=max_images,
+        )
+        _write_batches_unlocked(output_dir, serializable)
+        return batches
+
+
+def save_generation_batch(
+    output_dir: Path,
+    *,
+    batch_id: str,
+    prompt: str,
+    provider: str,
+    images: Iterable[Path],
+    retention_days: int = 7,
+    max_batches: int = 100,
+    max_images: int = 500,
+    created_at: float | None = None,
+) -> list[dict]:
+    """Persist one completed generation run independently of browser state."""
+    retention_days = normalize_retention_days(retention_days)
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    image_names: list[str] = []
+    seen_names: set[str] = set()
+    for raw_path in images:
+        path = _safe_image_path(output_dir, Path(raw_path).name)
+        if path is not None and path.exists() and path.name not in seen_names:
+            seen_names.add(path.name)
+            image_names.append(path.name)
+    if not image_names:
+        return load_generation_batches(
+            output_dir,
+            retention_days=retention_days,
+            max_batches=max_batches,
+            max_images=max_images,
+        )
+
+    with _LOCK:
+        current = [
+            batch
+            for batch in _read_batches_unlocked(output_dir)
+            if isinstance(batch, dict) and str(batch.get("id", "")) != str(batch_id)
+        ]
+        current.append(
+            {
+                "id": str(batch_id),
+                "created_at": float(created_at if created_at is not None else time.time()),
+                "prompt": str(prompt),
+                "provider": str(provider),
+                "images": image_names,
+            }
+        )
+        serializable, batches = _normalize_batches_unlocked(
+            output_dir,
+            current,
+            cutoff=cutoff,
+            max_batches=max_batches,
+            max_images=max_images,
+        )
+        _write_batches_unlocked(output_dir, serializable)
+        return batches
 
 
 def create_gallery_zip(

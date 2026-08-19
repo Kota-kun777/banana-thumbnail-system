@@ -16,7 +16,9 @@ from gallery_persistence import (
     clear_gallery,
     create_gallery_zip,
     load_gallery,
+    load_generation_batches,
     normalize_retention_days,
+    save_generation_batch,
 )
 
 try:
@@ -61,9 +63,12 @@ OPENAI_SIZE_OPTIONS = [
 ]
 OPENAI_QUALITY_OPTIONS = ["high", "medium", "low", "auto"]
 
-# ギャラリーに蓄積できる最大枚数（この枚数に達するとリセットが必要になる）。
+# 同じプロンプトの作業ギャラリーに蓄積できる最大枚数。
+# プロンプト変更時は生成履歴へ退避して新しい作業ギャラリーを始める。
 # 大きくしすぎると Streamlit Cloud のメモリ／表示が重くなる点だけ注意。
 MAX_GALLERY = 200
+MAX_ARCHIVE_IMAGES = 500
+MAX_GENERATION_BATCHES = 100
 DEFAULT_GENERATION_COUNT = 10
 DEFAULT_CONCURRENCY = 10
 DEFAULTS_VERSION = 20260628
@@ -276,7 +281,8 @@ def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                       openai_size="1536x1024",
                       openai_quality="high",
                       openai_crop_16_9=True,
-                      max_workers=DEFAULT_CONCURRENCY):
+                      max_workers=DEFAULT_CONCURRENCY,
+                      retention_days=DEFAULT_GALLERY_RETENTION_DAYS):
     """バックグラウンドスレッドで画像を並列生成するワーカー関数。
 
     各画像を ThreadPoolExecutor のタスクとして同時実行する。
@@ -324,6 +330,28 @@ def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                 state.status = f"⏹️ ユーザーにより停止（{state.success_count}枚生成済み）"
 
     finally:
+        # ブラウザを閉じても履歴が残るよう、UIフラグメントではなく生成ワーカー側で
+        # 今回のプロンプトと完成画像を1バッチとして記録する。
+        with state.lock:
+            completed_images = [Path(path) for path in state.images]
+        if completed_images:
+            try:
+                save_generation_batch(
+                    output_dir,
+                    batch_id=timestamp,
+                    prompt=prompt,
+                    provider=provider,
+                    images=completed_images,
+                    retention_days=retention_days,
+                    max_batches=MAX_GENERATION_BATCHES,
+                    max_images=MAX_ARCHIVE_IMAGES,
+                )
+            except Exception as e:
+                import sys
+                print(
+                    f"[generation_history] 履歴保存失敗: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
         with state.lock:
             state.running = False
             state.finished = True
@@ -805,13 +833,38 @@ st.session_state.gallery_images = load_gallery(
     retention_days=gallery_retention_days,
     max_images=MAX_GALLERY,
 )
+generation_batches = load_generation_batches(
+    output_dir,
+    retention_days=gallery_retention_days,
+    max_batches=MAX_GENERATION_BATCHES,
+    max_images=MAX_ARCHIVE_IMAGES,
+)
+
+# 新しいブラウザでは、現在のギャラリーに含まれる最新バッチのプロンプトを復元。
+if "active_gallery_prompt" not in st.session_state:
+    active_names = {path.name for path in st.session_state.gallery_images}
+    matching_batch = next(
+        (
+            batch for batch in generation_batches
+            if any(path.name in active_names for path in batch["images"])
+        ),
+        None,
+    )
+    st.session_state.active_gallery_prompt = (
+        matching_batch["prompt"] if matching_batch else ""
+    )
 
 # プロンプト入力用のセッション状態を初期化
 if "current_prompt" not in st.session_state:
     st.session_state.current_prompt = ""
 
+if "prompt_input" not in st.session_state:
+    st.session_state.prompt_input = st.session_state.current_prompt
+
 def set_prompt(text):
     st.session_state.current_prompt = text
+    st.session_state.prompt_input = text
+    st.session_state.prompt_loaded_notice = True
 
 # 生成枚数の選択用コールバック
 if "gen_count" not in st.session_state:
@@ -1156,6 +1209,12 @@ with st.sidebar:
                 use_container_width=True,
             )
 
+    if st.session_state.get("prompt_loaded_notice"):
+        loaded_preview = st.session_state.prompt_input.replace("\n", " ").strip()
+        if len(loaded_preview) > 60:
+            loaded_preview = loaded_preview[:60] + "..."
+        st.success(f"入力欄へ読み込みました：{loaded_preview}")
+
     # プロンプト履歴のバックアップ・復元（万一 LS もファイルも失われた際の保険）
     st.markdown("---")
     with st.expander("🗃️ 履歴のバックアップ／復元"):
@@ -1255,11 +1314,15 @@ with st.sidebar:
     # ギャラリー状況の表示
     st.markdown("---")
     gallery_count = len(st.session_state.gallery_images)
-    st.markdown(f"**📊 現在のギャラリー: {gallery_count} / {MAX_GALLERY} 枚**")
+    st.markdown(
+        f"**📊 現在の作業ギャラリー: {gallery_count} / {MAX_GALLERY} 枚**"
+    )
     st.caption(
-        f"直近 {gallery_retention_days} 日分を共有ギャラリーに保持します。"
-        "ブラウザを閉じても復元できますが、Streamlitサーバー再起動時は"
-        "消える場合があるため、必要な画像はZIPでも保存してください。"
+        "同じプロンプトでは最大200枚まで追加できます。プロンプトを変えると"
+        "新しい作業ギャラリーになり、以前の画像は「プロンプト別の生成履歴」へ"
+        f"直近{gallery_retention_days}日・最大{MAX_ARCHIVE_IMAGES}枚まで残ります。"
+        "Streamlitサーバー再起動時は消える場合があるため、必要な画像はZIPでも"
+        "保存してください。"
     )
 
     if st.button(
@@ -1306,7 +1369,7 @@ with st.sidebar:
                     )
 
         if st.button(
-            "🆕 ギャラリーをリセット（新しく始める）",
+            "🆕 作業ギャラリーをリセット（履歴は残す）",
             key="reset_shared_gallery",
             use_container_width=True,
         ):
@@ -1322,7 +1385,100 @@ with st.sidebar:
 if st.session_state.gallery_images:
     gallery_count = len(st.session_state.gallery_images)
     st.subheader(f"🖼️ 生成ギャラリー（{gallery_count} 枚）")
+    if st.session_state.get("active_gallery_prompt"):
+        active_preview = st.session_state.active_gallery_prompt.replace("\n", " ")
+        if len(active_preview) > 100:
+            active_preview = active_preview[:100] + "..."
+        st.caption(f"現在のプロンプト: {active_preview}")
     show_gallery(st.session_state.gallery_images, "main_gallery")
+    st.markdown("---")
+
+# --- プロンプト別の生成履歴（作業ギャラリー200枚とは別枠） ---
+if generation_batches:
+    with st.expander(
+        f"🗂️ プロンプト別の生成履歴（{len(generation_batches)} 回）",
+        expanded=False,
+    ):
+        st.caption(
+            f"直近{gallery_retention_days}日・最大{MAX_ARCHIVE_IMAGES}枚を、"
+            f"最大{MAX_GENERATION_BATCHES}回の生成単位で保存します。"
+        )
+        batches_by_id = {batch["id"]: batch for batch in generation_batches}
+
+        def _format_batch_label(batch_id):
+            batch = batches_by_id[batch_id]
+            created = datetime.fromtimestamp(batch["created_at"]).strftime(
+                "%m/%d %H:%M"
+            )
+            preview = batch["prompt"].replace("\n", " ").strip()
+            if len(preview) > 42:
+                preview = preview[:42] + "..."
+            return f"{created}｜{len(batch['images'])}枚｜{preview}"
+
+        selected_batch_id = st.selectbox(
+            "表示する生成履歴",
+            options=list(batches_by_id),
+            format_func=_format_batch_label,
+            key="selected_generation_batch",
+        )
+        selected_batch = batches_by_id[selected_batch_id]
+        provider_label = (
+            "OpenAI" if selected_batch["provider"] == "openai" else "Gemini"
+        )
+        st.caption(
+            f"生成モデル: {provider_label} ／ "
+            f"保存画像: {len(selected_batch['images'])}枚"
+        )
+        st.markdown("**この回で使ったプロンプト**")
+        st.code(
+            selected_batch["prompt"],
+            language=None,
+            wrap_lines=True,
+            height=240,
+        )
+        st.button(
+            "📝 このプロンプトを入力欄へ読み込む",
+            key=f"load_batch_prompt_{selected_batch_id}",
+            on_click=set_prompt,
+            args=(selected_batch["prompt"],),
+            use_container_width=True,
+        )
+        show_gallery(
+            selected_batch["images"],
+            f"generation_batch_{selected_batch_id}",
+        )
+
+        if st.button(
+            "📦 この回の画像をZIPにする",
+            key=f"prepare_batch_zip_{selected_batch_id}",
+            use_container_width=True,
+        ):
+            with st.spinner("ZIPを作成しています..."):
+                batch_archive = create_gallery_zip(
+                    output_dir,
+                    selected_batch["images"],
+                    archive_key=(
+                        f"{st.session_state.session_id}_{selected_batch_id}"
+                    ),
+                )
+            st.session_state["batch_archive"] = {
+                "batch_id": selected_batch_id,
+                "path": str(batch_archive),
+            }
+
+        batch_archive_state = st.session_state.get("batch_archive") or {}
+        if batch_archive_state.get("batch_id") == selected_batch_id:
+            batch_archive_path = Path(batch_archive_state.get("path", ""))
+            if batch_archive_path.exists():
+                with open(batch_archive_path, "rb") as archive_file:
+                    st.download_button(
+                        "💾 この回のZIPをダウンロード",
+                        data=archive_file.read(),
+                        file_name=f"banana_batch_{selected_batch_id}.zip",
+                        mime="application/zip",
+                        key=f"download_batch_zip_{selected_batch_id}",
+                        use_container_width=True,
+                    )
     st.markdown("---")
 
 # --- 生成モニター（生成中のみ表示） ---
@@ -1364,8 +1520,17 @@ if st.session_state.past_prompts:
 
 # 生成枚数の選択（on_clickコールバックで更新 → プロンプトが消えない）
 gallery_count = len(st.session_state.gallery_images)
-remaining = MAX_GALLERY - gallery_count
+active_prompt = st.session_state.get("active_gallery_prompt", "").strip()
+draft_prompt = st.session_state.get("prompt_input", "").strip()
+starts_new_gallery = bool(
+    active_prompt and draft_prompt and draft_prompt != active_prompt
+)
+effective_gallery_count = 0 if starts_new_gallery else gallery_count
+remaining = MAX_GALLERY - effective_gallery_count
 is_max = remaining <= 0
+
+if st.session_state.pop("prompt_loaded_notice", False):
+    st.success("✅ 選択したプロンプトを下の入力欄へ読み込みました。")
 
 st.markdown("**🔢 生成枚数:**")
 count_cols = st.columns(4)
@@ -1384,7 +1549,9 @@ for i, count in enumerate([3, 5, 10, 20]):
 chosen_count = st.session_state.gen_count
 
 # ボタンラベル
-if is_max:
+if starts_new_gallery:
+    btn_label = f"✨ 新しいプロンプトで新規ギャラリーを開始（{chosen_count}枚）"
+elif is_max:
     btn_label = f"🚫 最大{MAX_GALLERY}枚に達しました（リセットしてください）"
 elif st.session_state.generating:
     btn_label = "⏳ 生成中..."
@@ -1398,17 +1565,28 @@ else:
 with st.form(key="prompt_form"):
     prompt = st.text_area(
         "プロンプトまたは修正指示を入力してください... (例: オフィス背景で明るく)",
-        value=st.session_state.current_prompt,
+        key="prompt_input",
         height=400,
     )
     submit_button = st.form_submit_button(
         label=btn_label,
         use_container_width=True,
         type="primary",
-        disabled=is_max or st.session_state.generating,
+        disabled=st.session_state.generating,
     )
 
-if submit_button and prompt and not is_max and not st.session_state.generating:
+if submit_button and prompt and not st.session_state.generating:
+    previous_active_prompt = st.session_state.get("active_gallery_prompt", "").strip()
+    prompt_changed = bool(
+        previous_active_prompt and prompt.strip() != previous_active_prompt
+    )
+    if len(st.session_state.gallery_images) >= MAX_GALLERY and not prompt_changed:
+        st.error(
+            f"同じプロンプトのギャラリーが最大{MAX_GALLERY}枚です。"
+            "別のプロンプトへ変更するか、ギャラリーをリセットしてください。"
+        )
+        st.stop()
+
     # 前回のエラーをクリア
     st.session_state.last_gen_errors = []
     st.session_state.last_gen_success = None
@@ -1427,6 +1605,14 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
         if not api_key:
             st.error("左のサイドバーから Gemini API Key を設定してください。")
             st.stop()
+
+    # プロンプトを変えた場合は、旧画像を生成履歴へ残したまま作業ギャラリーだけ新規化。
+    if prompt_changed:
+        clear_gallery(output_dir)
+        st.session_state.gallery_images = []
+        st.session_state["gidx_main_gallery"] = 0
+        st.session_state.pop("gallery_archive_path", None)
+    st.session_state.active_gallery_prompt = prompt.strip()
 
     # 今回生成する枚数（選択した枚数、ただし上限 MAX_GALLERY 枚を超えない）
     num_to_generate = min(st.session_state.gen_count, MAX_GALLERY - len(st.session_state.gallery_images))
@@ -1480,6 +1666,7 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
             st.session_state.openai_quality,
             st.session_state.openai_crop_16_9,
             st.session_state.concurrency,
+            gallery_retention_days,
         ),
         daemon=True,
     )
