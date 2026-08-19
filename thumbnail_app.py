@@ -11,6 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from PIL import Image
 
+from gallery_persistence import (
+    append_gallery_images,
+    clear_gallery,
+    create_gallery_zip,
+    load_gallery,
+    normalize_retention_days,
+)
+
 try:
     from google import genai
     from google.genai import types
@@ -60,6 +68,7 @@ DEFAULT_GENERATION_COUNT = 10
 DEFAULT_CONCURRENCY = 10
 DEFAULTS_VERSION = 20260628
 ILLUSTRATION_MODE_KEY = f"illustration_mode_{DEFAULTS_VERSION}"
+DEFAULT_GALLERY_RETENTION_DAYS = 7
 
 # ページ設定
 st.set_page_config(page_title="Banana Replica UI", page_icon="🍌", layout="wide")
@@ -434,20 +443,109 @@ _LS_KEY = "banana_past_prompts"
 # 真因: localStorage はブラウザ × デバイス単位のため デスクトップ PC と Mac で別 LS
 #       → 別デバイスから見ると履歴が「消えた」ように見える
 # 対策: GitHub Gist を 真の真実の源 (= source of truth) として 全デバイスから 同じ履歴 を参照
-# 設定: Streamlit Secrets に github_token (= PAT, gist scope) と gist_id を 登録
+# 設定: Streamlit Secrets に github_token (= PAT, gist scope) を登録。
+# gist_id は任意。未指定なら同じトークンの既存Gistを探し、初回保存時に自動作成する。
 _GIST_FILENAME = "banana_past_prompts.json"
+_GIST_DESCRIPTION = "Banana Thumbnail System persistence"
+
+
+@st.cache_resource
+def _init_gist_store():
+    """全ブラウザセッションで共有するGistロックと自動検出ID。"""
+    return {"lock": threading.RLock(), "gist_id": None}
+
+
+_gist_store = _init_gist_store()
+
+
+def _get_secret_alias(*keys):
+    """Streamlit Secrets の大文字・小文字どちらの命名も受け付ける。"""
+    for key in keys:
+        try:
+            value = st.secrets.get(key, "")
+        except Exception:
+            value = ""
+        if value:
+            return str(value).strip()
+    return ""
 
 
 def _get_gist_config():
     """Streamlit Secrets から GitHub Gist 設定を取得 (= 未設定なら None)。"""
-    try:
-        token = st.secrets.get("github_token", "")
-        gist_id = st.secrets.get("gist_id", "")
-        if token and gist_id:
-            return {"token": token.strip(), "gist_id": gist_id.strip()}
-    except Exception:
-        pass
+    token = _get_secret_alias("github_token", "GITHUB_TOKEN")
+    gist_id = _get_secret_alias("gist_id", "GIST_ID")
+    if not token:
+        return None
+    return {"token": token, "gist_id": gist_id}
+
+
+def _gist_request(cfg, url, *, method="GET", payload=None):
+    """GitHub Gist API を呼ぶ。トークン値はログへ出さない。"""
+    import urllib.request
+
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {cfg['token']}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "banana-thumbnail-sync",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
+def _resolve_gist_id(cfg):
+    """明示ID、同プロセスのキャッシュ、既存Gistの順で同期先を解決する。"""
+    if cfg.get("gist_id"):
+        _gist_store["gist_id"] = cfg["gist_id"]
+        return cfg["gist_id"]
+    if _gist_store.get("gist_id"):
+        return _gist_store["gist_id"]
+
+    data = _gist_request(cfg, "https://api.github.com/gists?per_page=100")
+    if not isinstance(data, list):
+        return None
+
+    # 説明が一致するものを優先し、旧版のファイル名一致にも後方互換で対応。
+    candidates = [
+        gist for gist in data
+        if isinstance(gist, dict)
+        and _GIST_FILENAME in (gist.get("files") or {})
+    ]
+    matched = next(
+        (gist for gist in candidates if gist.get("description") == _GIST_DESCRIPTION),
+        candidates[0] if candidates else None,
+    )
+    if matched and matched.get("id"):
+        _gist_store["gist_id"] = str(matched["id"])
+        return _gist_store["gist_id"]
     return None
+
+
+def _parse_gist_prompts(cfg, target):
+    """通常レスポンスと1MB超Gistのraw_urlフォールバックを扱う。"""
+    if not target:
+        return []
+    content = target.get("content", "")
+    if target.get("truncated") and target.get("raw_url"):
+        raw_data = _gist_request(cfg, target["raw_url"])
+        # raw_url は JSON 文書そのものを返すため、_gist_request が既にparse済み。
+        return _normalize_prompts(raw_data)
+    if not content:
+        return []
+    try:
+        return _normalize_prompts(json.loads(content))
+    except Exception:
+        return None
 
 
 def _load_prompts_from_gist():
@@ -458,31 +556,13 @@ def _load_prompts_from_gist():
     if not cfg:
         return None
     try:
-        import urllib.request
-        import urllib.error
-        url = f"https://api.github.com/gists/{cfg['gist_id']}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {cfg['token']}",
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "banana-thumbnail-sync",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        files = data.get("files") or {}
-        target = files.get(_GIST_FILENAME)
-        if not target:
-            return []  # Gist は存在するがファイルなし = 初回
-        content = target.get("content", "")
-        if not content:
-            return []
-        try:
-            parsed = json.loads(content)
-            return _normalize_prompts(parsed)
-        except Exception:
-            return None
+        with _gist_store["lock"]:
+            gist_id = _resolve_gist_id(cfg)
+            if not gist_id:
+                return []  # トークン設定済み・まだ同期Gistなし = 初回
+            data = _gist_request(cfg, f"https://api.github.com/gists/{gist_id}")
+            target = (data.get("files") or {}).get(_GIST_FILENAME)
+            return _parse_gist_prompts(cfg, target)
     except Exception as e:
         import sys
         print(f"[gist_load] ⚠️ Gist 取得失敗 (LS/ファイルで継続): {type(e).__name__}: {e}",
@@ -490,42 +570,60 @@ def _load_prompts_from_gist():
         return None
 
 
-def _save_prompts_to_gist(prompts_list):
-    """GitHub Gist に past_prompts を保存 (= デバイス横断同期)。
-    未設定 / 失敗時は何もしない (= LS+ファイル保存は別途実施済)。
+def _sync_prompts_to_gist(prompts_list):
+    """クラウド最新版を先にマージしてからGistへ保存する。
+
+    戻り値は ``(成功したか, マージ済み履歴)``。取得失敗時は書き込まず、
+    別デバイスの未取得データを古いブラウザから上書きしない。
     """
     cfg = _get_gist_config()
     if not cfg:
-        return False
+        return False, _normalize_prompts(prompts_list)
     try:
-        import urllib.request
-        url = f"https://api.github.com/gists/{cfg['gist_id']}"
-        payload = json.dumps({
-            "files": {
+        with _gist_store["lock"]:
+            remote = _load_prompts_from_gist()
+            if remote is None:
+                return False, _normalize_prompts(prompts_list)
+            merged = _merge_prompts(prompts_list, remote)
+            gist_id = _resolve_gist_id(cfg)
+            file_payload = {
                 _GIST_FILENAME: {
-                    "content": json.dumps(prompts_list, ensure_ascii=False, indent=2)
+                    "content": json.dumps(merged, ensure_ascii=False, indent=2)
                 }
             }
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            method="PATCH",
-            headers={
-                "Authorization": f"Bearer {cfg['token']}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "User-Agent": "banana-thumbnail-sync",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp.read()  # 応答消化のみ
-        return True
+            if gist_id:
+                _gist_request(
+                    cfg,
+                    f"https://api.github.com/gists/{gist_id}",
+                    method="PATCH",
+                    payload={"files": file_payload},
+                )
+            else:
+                created = _gist_request(
+                    cfg,
+                    "https://api.github.com/gists",
+                    method="POST",
+                    payload={
+                        "description": _GIST_DESCRIPTION,
+                        "public": False,
+                        "files": file_payload,
+                    },
+                )
+                if not created.get("id"):
+                    return False, merged
+                _gist_store["gist_id"] = str(created["id"])
+            return True, merged
     except Exception as e:
         import sys
         print(f"[gist_save] ⚠️ Gist 書込み失敗 (LS+ファイルは保存済): "
               f"{type(e).__name__}: {e}", file=sys.stderr)
-        return False
+        return False, _normalize_prompts(prompts_list)
+
+
+def _save_prompts_to_gist(prompts_list):
+    """後方互換用のboolラッパー。"""
+    saved, _ = _sync_prompts_to_gist(prompts_list)
+    return saved
 
 
 def _normalize_prompts(data):
@@ -616,7 +714,7 @@ else:
 
 
 def save_prompt(new_prompt):
-    """プロンプトを履歴の先頭に追加し、ファイル／LS 両方へ保存する。
+    """プロンプトを履歴の先頭に追加し、Gist／ファイル／LSへ保存する。
 
     🚨 2026-05-09 改: 順序を「ファイル → LS」 に逆転 (旧: LS → ファイル)
     旧版は LS write (streamlit_local_storage.setItem) が稀に rerun 例外を投げて、
@@ -624,10 +722,9 @@ def save_prompt(new_prompt):
     ファイル mtime が 2/28 で固定されており、 ブラウザ LS が消えると新プロンプトが
     全て失われていた (社長 5/9 報告)。
 
-    対策:
-      1. ファイル書込みを最優先 (アトミック: temp + rename で破損も防止)
-      2. ファイル書込みが失敗したら stderr にログ出力 (silent fail 排除)
-      3. LS 書込みは最後 (失敗しても最低限ファイルは生きている)
+    現行版では、まずGist最新版を取得してマージする。これにより、先に開いていた
+    PCブラウザがスマホ側の新しい履歴を古い状態で上書きする競合も防止する。
+    その後、アトミックなファイル書込み → LS の順でローカル退避する。
     """
     if not new_prompt:
         return
@@ -638,9 +735,14 @@ def save_prompt(new_prompt):
     if new_prompt in base:
         base.remove(new_prompt)
     base.insert(0, new_prompt)
-    st.session_state.past_prompts = base[:50]
 
-    # ① サーバー側ファイル — 永続性最優先 (アトミック書込み)
+    # ① Gist — 保存前にクラウド最新版をマージ（lost update 防止）。
+    gist_saved, gist_merged = _sync_prompts_to_gist(base[:50])
+    st.session_state.past_prompts = gist_merged if gist_saved else base[:50]
+    if gist_saved:
+        st.session_state["_gist_cached"] = list(st.session_state.past_prompts)
+
+    # ② サーバー側ファイル — ブラウザ間共有のフォールバック (アトミック書込み)
     try:
         tmp_path = past_prompts_file.with_suffix(".json.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -655,7 +757,7 @@ def save_prompt(new_prompt):
             file=sys.stderr,
         )
 
-    # ② localStorage — ブラウザ便宜上の二次保存 (失敗してもファイルが残る)
+    # ③ localStorage — 同じブラウザ向けの二次保存 (失敗してもファイルが残る)
     if _ls_instance is not None:
         try:
             _ls_instance.setItem(
@@ -670,13 +772,23 @@ def save_prompt(new_prompt):
                 file=sys.stderr,
             )
 
-    # ③ 🆕 GitHub Gist — デバイス横断同期 (= 真の真実の源)
-    # 失敗してもファイル+LSが保存済のため UI ブロックしない・5秒タイムアウト内蔵
-    _save_prompts_to_gist(st.session_state.past_prompts)
-
 # 出力ディレクトリ
 output_dir = Path(__file__).parent / "replica_output"
 output_dir.mkdir(exist_ok=True, parents=True)
+
+# ブラウザを閉じても復元できる共有ギャラリー。Streamlit Cloud の実行領域なので
+# サーバー再起動時の保証はなく、確実に残す用途には下の ZIP ダウンロードを使う。
+gallery_retention_days = normalize_retention_days(
+    _get_secret_alias("gallery_retention_days", "GALLERY_RETENTION_DAYS")
+    or os.environ.get("GALLERY_RETENTION_DAYS")
+    or DEFAULT_GALLERY_RETENTION_DAYS,
+    default=DEFAULT_GALLERY_RETENTION_DAYS,
+)
+st.session_state.gallery_images = load_gallery(
+    output_dir,
+    retention_days=gallery_retention_days,
+    max_images=MAX_GALLERY,
+)
 
 # プロンプト入力用のセッション状態を初期化
 if "current_prompt" not in st.session_state:
@@ -797,15 +909,23 @@ def generation_monitor():
             state.status = ""
             state.stop_requested = False
 
-        # session_stateにギャラリー画像を追加
-        old_count = len(st.session_state.gallery_images)
-        for img in new_images:
-            if img not in st.session_state.gallery_images:
-                st.session_state.gallery_images.append(img)
+        # 共有マニフェストへ先に追記し、別ブラウザでも復元できる状態にする。
+        old_names = {img.name for img in st.session_state.gallery_images}
+        st.session_state.gallery_images = append_gallery_images(
+            output_dir,
+            new_images,
+            retention_days=gallery_retention_days,
+            max_images=MAX_GALLERY,
+        )
 
         # ギャラリーインデックスを新しい画像の先頭に移動
-        if len(st.session_state.gallery_images) > old_count:
-            st.session_state["gidx_main_gallery"] = old_count
+        new_indices = [
+            idx for idx, img in enumerate(st.session_state.gallery_images)
+            if img.name not in old_names
+        ]
+        if new_indices:
+            st.session_state["gidx_main_gallery"] = new_indices[0]
+        st.session_state.pop("gallery_archive_path", None)
 
         st.session_state.last_gen_errors = new_errors
         st.session_state.last_gen_success = success_count
@@ -1034,7 +1154,8 @@ with st.sidebar:
             st.warning(
                 "☁️ **Gist 同期: 未設定** "
                 "(デバイス横断永続化を有効にするには Streamlit Secrets に "
-                "`github_token` (PAT, gist scope) と `gist_id` を登録してください)"
+                "`github_token` (PAT, gist scope) を登録してください。"
+                "`gist_id` は任意です)"
             )
         elif _gist_cached is None:
             st.error(
@@ -1058,7 +1179,12 @@ with st.sidebar:
                         st.error("再取得失敗")
             with col_b:
                 if st.button("☁️ Gist へ手動 push", use_container_width=True):
-                    if _save_prompts_to_gist(st.session_state.past_prompts):
+                    saved, merged = _sync_prompts_to_gist(
+                        st.session_state.past_prompts
+                    )
+                    if saved:
+                        st.session_state.past_prompts = merged
+                        st.session_state["_gist_cached"] = list(merged)
                         st.success("✅ Gist 更新成功")
                     else:
                         st.error("Gist 更新失敗")
@@ -1100,6 +1226,10 @@ with st.sidebar:
                             json.dump(merged, f, ensure_ascii=False, indent=2)
                     except Exception:
                         pass
+                    gist_saved, gist_merged = _sync_prompts_to_gist(merged)
+                    if gist_saved:
+                        st.session_state.past_prompts = gist_merged
+                        st.session_state["_gist_cached"] = list(gist_merged)
                     st.success(f"{len(merged)} 件に復元しました")
                 else:
                     st.error("JSONの形式が正しくありません（文字列の配列が必要）")
@@ -1110,9 +1240,63 @@ with st.sidebar:
     st.markdown("---")
     gallery_count = len(st.session_state.gallery_images)
     st.markdown(f"**📊 現在のギャラリー: {gallery_count} / {MAX_GALLERY} 枚**")
+    st.caption(
+        f"直近 {gallery_retention_days} 日分を共有ギャラリーに保持します。"
+        "ブラウザを閉じても復元できますが、Streamlitサーバー再起動時は"
+        "消える場合があるため、必要な画像はZIPでも保存してください。"
+    )
+
+    if st.button(
+        "🔄 共有ギャラリーを再読み込み",
+        key="refresh_shared_gallery",
+        use_container_width=True,
+    ):
+        st.session_state.gallery_images = load_gallery(
+            output_dir,
+            retention_days=gallery_retention_days,
+            max_images=MAX_GALLERY,
+        )
+        st.rerun()
+
     if gallery_count > 0:
-        if st.button("🔄 ギャラリーをリセット（新しく始める）", use_container_width=True):
+        if st.button(
+            "📦 全画像のZIPを準備",
+            key="prepare_gallery_zip",
+            use_container_width=True,
+        ):
+            with st.spinner("ZIPを作成しています..."):
+                archive_path = create_gallery_zip(
+                    output_dir,
+                    st.session_state.gallery_images,
+                    archive_key=st.session_state.session_id,
+                )
+            st.session_state["gallery_archive_path"] = str(archive_path)
+
+        archive_value = st.session_state.get("gallery_archive_path")
+        if archive_value:
+            archive_path = Path(archive_value)
+            if archive_path.exists():
+                with open(archive_path, "rb") as archive_file:
+                    st.download_button(
+                        "💾 ZIPをダウンロード",
+                        data=archive_file.read(),
+                        file_name=(
+                            "banana_thumbnails_"
+                            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                        ),
+                        mime="application/zip",
+                        key="download_gallery_zip",
+                        use_container_width=True,
+                    )
+
+        if st.button(
+            "🆕 ギャラリーをリセット（新しく始める）",
+            key="reset_shared_gallery",
+            use_container_width=True,
+        ):
+            clear_gallery(output_dir)
             st.session_state.gallery_images = []
+            st.session_state.pop("gallery_archive_path", None)
             st.rerun()
 
 
@@ -1230,7 +1414,8 @@ if submit_button and prompt and not is_max and not st.session_state.generating:
 
     # 今回生成する枚数（選択した枚数、ただし上限 MAX_GALLERY 枚を超えない）
     num_to_generate = min(st.session_state.gen_count, MAX_GALLERY - len(st.session_state.gallery_images))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 複数ブラウザから同時生成してもファイル名が衝突しないようマイクロ秒まで含める。
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     start_num = len(st.session_state.gallery_images) + 1
 
     # 参考画像のバイト列を収集（エンジンに依存しない形で渡す）
