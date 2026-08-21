@@ -93,6 +93,7 @@ class GalleryPersistenceTests(unittest.TestCase):
             batch_id="batch-1",
             prompt="最初のプロンプト",
             provider="gemini",
+            model="gemini-3.1-flash-image",
             images=[first, second],
             created_at=time.time(),
         )
@@ -102,6 +103,7 @@ class GalleryPersistenceTests(unittest.TestCase):
 
         self.assertEqual(1, len(batches))
         self.assertEqual("最初のプロンプト", batches[0]["prompt"])
+        self.assertEqual("gemini-3.1-flash-image", batches[0]["model"])
         self.assertEqual([first, second], batches[0]["images"])
 
     def test_generation_batches_are_newest_first_and_honor_image_cap(self):
@@ -123,6 +125,9 @@ class GalleryPersistenceTests(unittest.TestCase):
             batch_id="newer",
             prompt="新しいプロンプト",
             provider="openai",
+            model="gpt-image-2",
+            size="1536x864",
+            quality="medium",
             images=[third],
             created_at=now,
             max_images=10,
@@ -132,6 +137,9 @@ class GalleryPersistenceTests(unittest.TestCase):
 
         self.assertEqual(["newer", "older"], [batch["id"] for batch in batches])
         self.assertEqual([third], batches[0]["images"])
+        self.assertEqual("gpt-image-2", batches[0]["model"])
+        self.assertEqual("1536x864", batches[0]["size"])
+        self.assertEqual("medium", batches[0]["quality"])
         self.assertEqual([first], batches[1]["images"])
 
     def test_retention_is_bounded(self):

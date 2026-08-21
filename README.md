@@ -2,6 +2,13 @@
 
 Streamlit でサムネイルを生成するアプリです。
 
+## モデル比較
+
+- 既定値は従来どおり Gemini 3 Pro / GPT Image 2 の高品質設定です。
+- Gemini は 3.1 Flash（低コスト・バランス）と 3.1 Flash Lite（最安・1K）を選べます。
+- OpenAI は GPT Image 2 の high / medium / low を比較できます。旧廉価モデルの GPT Image 1 mini も比較用に選べますが、公式に非推奨のため継続運用には使わないでください。
+- 生成履歴には、使用したモデル名とOpenAIの品質・サイズが記録されます。
+
 ## 保存の仕組み
 
 - プロンプト履歴

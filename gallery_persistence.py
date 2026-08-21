@@ -251,7 +251,7 @@ def _write_batches_unlocked(output_dir: Path, batches: list[dict]) -> None:
     temp_path = path.with_suffix(".json.tmp")
     temp_path.write_text(
         json.dumps(
-            {"version": 1, "batches": batches},
+            {"version": 2, "batches": batches},
             ensure_ascii=False,
             indent=2,
         ),
@@ -277,6 +277,12 @@ def _normalize_batches_unlocked(
         batch_id = str(raw.get("id", "")).strip()
         prompt = raw.get("prompt", "")
         provider = str(raw.get("provider", "")).strip() or "unknown"
+        model = raw.get("model", "")
+        size = raw.get("size", "")
+        quality = raw.get("quality", "")
+        model = model.strip() if isinstance(model, str) else ""
+        size = size.strip() if isinstance(size, str) else ""
+        quality = quality.strip() if isinstance(quality, str) else ""
         if not batch_id or batch_id in seen_ids or not isinstance(prompt, str):
             continue
         try:
@@ -306,6 +312,9 @@ def _normalize_batches_unlocked(
                 "created_at": created_at,
                 "prompt": prompt,
                 "provider": provider,
+                "model": model,
+                "size": size,
+                "quality": quality,
                 "images": paths,
             }
         )
@@ -331,6 +340,9 @@ def _normalize_batches_unlocked(
             "created_at": batch["created_at"],
             "prompt": batch["prompt"],
             "provider": batch["provider"],
+            "model": batch["model"],
+            "size": batch["size"],
+            "quality": batch["quality"],
             "images": [path.name for path in batch["images"]],
         }
         for batch in kept
@@ -368,6 +380,9 @@ def save_generation_batch(
     batch_id: str,
     prompt: str,
     provider: str,
+    model: str = "",
+    size: str = "",
+    quality: str = "",
     images: Iterable[Path],
     retention_days: int = 7,
     max_batches: int = 100,
@@ -404,6 +419,9 @@ def save_generation_batch(
                 "created_at": float(created_at if created_at is not None else time.time()),
                 "prompt": str(prompt),
                 "provider": str(provider),
+                "model": str(model),
+                "size": str(size),
+                "quality": str(quality),
                 "images": image_names,
             }
         )
