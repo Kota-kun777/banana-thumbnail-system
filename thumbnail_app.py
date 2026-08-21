@@ -20,6 +20,18 @@ from gallery_persistence import (
     normalize_retention_days,
     save_generation_batch,
 )
+from image_model_options import (
+    GEMINI_IMAGE_MODEL_DEFAULT,
+    GEMINI_IMAGE_MODEL_OPTIONS,
+    OPENAI_IMAGE_2_SIZE_OPTIONS,
+    OPENAI_IMAGE_MODEL_DEFAULT,
+    OPENAI_IMAGE_MODEL_OPTIONS,
+    OPENAI_QUALITY_LABELS,
+    OPENAI_QUALITY_OPTIONS,
+    model_label,
+    openai_size_options,
+    openai_supports_custom_size,
+)
 
 try:
     from google import genai
@@ -47,21 +59,8 @@ except ImportError:
 # ==============================================================
 # 画像生成モデル設定
 # ==============================================================
-GEMINI_IMAGE_MODEL = "gemini-3-pro-image-preview"
-# OpenAI は 2026年時点の最新 gpt-image-2 をデフォルトに。アクセス不可の場合は
-# サイドバーの詳細設定で gpt-image-1 系へ切り替え可能。
-OPENAI_IMAGE_MODEL_DEFAULT = "gpt-image-2"
-# gpt-image-2 は「幅・高さとも16の倍数」制約あり（1920x1080 等は NG）。
-# 以下は 16:9 ぴったり＋16の倍数を満たすサイズ。
-OPENAI_SIZE_OPTIONS = [
-    "2048x1152",   # 16:9 高解像（2K相当）
-    "1792x1008",   # 16:9 中解像
-    "1536x864",    # 16:9 標準解像（推奨）
-    "1024x576",    # 16:9 低解像（高速生成）
-    "1024x1024",   # 1:1 正方形
-    "1024x1536",   # 2:3 縦長
-]
-OPENAI_QUALITY_OPTIONS = ["high", "medium", "low", "auto"]
+# 既定値は従来どおり。廉価モデルはサイドバーで明示的に選んだ場合だけ使う。
+OPENAI_SIZE_OPTIONS = OPENAI_IMAGE_2_SIZE_OPTIONS
 
 # 同じプロンプトの作業ギャラリーに蓄積できる最大枚数。
 # プロンプト変更時は生成履歴へ退避して新しい作業ギャラリーを始める。
@@ -112,15 +111,15 @@ def get_gen_state(session_id):
         return _gen_store["states"][session_id]
 
 
-def _generate_one_gemini(api_key, prompt, image_bytes_list):
-    """Gemini 3 Pro で画像を1枚生成。成功: (bytes, None) / 失敗: (None, 理由)"""
+def _generate_one_gemini(api_key, prompt, image_bytes_list, model):
+    """選択した Gemini モデルで画像を1枚生成。"""
     client = genai.Client(api_key=api_key)
     contents = [prompt]
     for img_bytes in image_bytes_list:
         contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
 
     response = client.models.generate_content(
-        model=GEMINI_IMAGE_MODEL,
+        model=model,
         contents=contents,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
@@ -217,7 +216,8 @@ def _generate_one_openai(api_key, prompt, image_bytes_list, model, size, quality
 
 def _generate_image_task(state, i, num_to_generate, provider, api_key, prompt,
                          image_bytes_list, output_dir, timestamp, start_num,
-                         openai_model, openai_size, openai_quality, openai_crop_16_9):
+                         gemini_model, openai_model, openai_size, openai_quality,
+                         openai_crop_16_9):
     """画像を1枚生成する（リトライ込み）。ThreadPoolExecutor で並列実行される。"""
     MAX_RETRIES = 3
     if state.stop_requested:
@@ -240,7 +240,7 @@ def _generate_image_task(state, i, num_to_generate, provider, api_key, prompt,
                 )
             else:
                 img_bytes, err = _generate_one_gemini(
-                    api_key, prompt, image_bytes_list,
+                    api_key, prompt, image_bytes_list, gemini_model,
                 )
 
             if img_bytes is not None:
@@ -277,6 +277,7 @@ def _generate_image_task(state, i, num_to_generate, provider, api_key, prompt,
 
 def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                       num_to_generate, output_dir, timestamp, start_num,
+                      gemini_model=GEMINI_IMAGE_MODEL_DEFAULT,
                       openai_model=OPENAI_IMAGE_MODEL_DEFAULT,
                       openai_size="1536x1024",
                       openai_quality="high",
@@ -306,8 +307,8 @@ def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                 executor.submit(
                     _generate_image_task, state, i, num_to_generate, provider,
                     api_key, prompt, image_bytes_list, output_dir, timestamp,
-                    start_num, openai_model, openai_size, openai_quality,
-                    openai_crop_16_9,
+                    start_num, gemini_model, openai_model, openai_size,
+                    openai_quality, openai_crop_16_9,
                 )
                 for i in range(num_to_generate)
             ]
@@ -341,6 +342,9 @@ def generation_worker(session_id, provider, api_key, prompt, image_bytes_list,
                     batch_id=timestamp,
                     prompt=prompt,
                     provider=provider,
+                    model=(openai_model if provider == "openai" else gemini_model),
+                    size=(openai_size if provider == "openai" else ""),
+                    quality=(openai_quality if provider == "openai" else ""),
                     images=completed_images,
                     retention_days=retention_days,
                     max_batches=MAX_GENERATION_BATCHES,
@@ -429,6 +433,8 @@ if "openai_api_key" not in st.session_state:
     st.session_state.openai_api_key = get_openai_api_key()
 if "provider_key" not in st.session_state:
     st.session_state.provider_key = "gemini"
+if "gemini_model" not in st.session_state:
+    st.session_state.gemini_model = GEMINI_IMAGE_MODEL_DEFAULT
 if "openai_model" not in st.session_state:
     st.session_state.openai_model = OPENAI_IMAGE_MODEL_DEFAULT
 if "openai_size" not in st.session_state:
@@ -1050,7 +1056,7 @@ with st.sidebar:
     # --- 画像生成モデル選択 ---
     provider_display = st.radio(
         "画像生成モデル",
-        options=["🍌 Gemini 3 Pro (nano-banana)", "🎨 OpenAI Images 2.0"],
+        options=["🍌 Gemini", "🎨 OpenAI"],
         index=0 if st.session_state.provider_key == "gemini" else 1,
         key="provider_display",
         help=(
@@ -1095,6 +1101,22 @@ with st.sidebar:
             if gem_input != st.session_state.gemini_api_key:
                 st.session_state.gemini_api_key = gem_input
                 st.rerun()
+
+        with st.expander("🔧 Gemini モデル比較"):
+            if st.session_state.gemini_model not in GEMINI_IMAGE_MODEL_OPTIONS:
+                st.session_state.gemini_model = GEMINI_IMAGE_MODEL_DEFAULT
+            st.selectbox(
+                "モデル",
+                options=list(GEMINI_IMAGE_MODEL_OPTIONS),
+                key="gemini_model",
+                format_func=model_label,
+                help="現在の高品質モデルを既定のまま、低コストモデルと比較できます。",
+            )
+            if st.session_state.gemini_model == "gemini-3.1-flash-lite-image":
+                st.info(
+                    "Flash Lite は最安・1K固定です。複数の参考画像や複雑な指示では、"
+                    "Pro／Flashより再現性が下がる場合があります。"
+                )
     else:
         if openai_from_secrets:
             st.success("✅ OpenAI API Key 設定済み")
@@ -1111,16 +1133,39 @@ with st.sidebar:
 
         # OpenAI 詳細設定（デフォルトで良ければ触らなくてOK）
         with st.expander("🔧 OpenAI 詳細設定"):
-            st.caption(f"モデル: `{OPENAI_IMAGE_MODEL_DEFAULT}` 固定")
-            # 既定を 1536x864（16:9 ぴったり・標準解像）に寄せる
-            if st.session_state.openai_size not in OPENAI_SIZE_OPTIONS:
-                default_size_idx = OPENAI_SIZE_OPTIONS.index("1536x864")
-            else:
-                default_size_idx = OPENAI_SIZE_OPTIONS.index(st.session_state.openai_size)
+            if st.session_state.openai_model not in OPENAI_IMAGE_MODEL_OPTIONS:
+                st.session_state.openai_model = OPENAI_IMAGE_MODEL_DEFAULT
+            st.selectbox(
+                "モデル",
+                options=list(OPENAI_IMAGE_MODEL_OPTIONS),
+                key="openai_model",
+                format_func=model_label,
+                help=(
+                    "GPT Image 2 が現在の既定です。mini は費用比較用の旧モデルで、"
+                    "将来利用できなくなる可能性があります。"
+                ),
+            )
+            if st.session_state.openai_model == "gpt-image-1-mini":
+                st.warning(
+                    "GPT Image 1 mini は公式に非推奨の旧モデルです。"
+                    "比較用としてのみ選択し、継続運用は GPT Image 2 を推奨します。"
+                )
+
+            selected_size_options = openai_size_options(
+                st.session_state.openai_model
+            )
+            size_choice_options = list(selected_size_options)
+            if openai_supports_custom_size(st.session_state.openai_model):
+                size_choice_options.append("カスタム")
+            if st.session_state.openai_size not in selected_size_options:
+                st.session_state.openai_size = selected_size_options[0]
+            if st.session_state.get("openai_size_choice") not in size_choice_options:
+                st.session_state.openai_size_choice = st.session_state.openai_size
+
+            # 選択モデルがAPIで受け付けるサイズだけを表示する。
             st.selectbox(
                 "サイズ",
-                options=OPENAI_SIZE_OPTIONS + ["カスタム"],
-                index=default_size_idx,
+                options=size_choice_options,
                 key="openai_size_choice",
                 help=(
                     "2048x1152 / 1792x1008 / 1536x864 / 1024x576 は 16:9 "
@@ -1146,10 +1191,9 @@ with st.sidebar:
             st.selectbox(
                 "品質",
                 options=OPENAI_QUALITY_OPTIONS,
-                index=OPENAI_QUALITY_OPTIONS.index(st.session_state.openai_quality)
-                if st.session_state.openai_quality in OPENAI_QUALITY_OPTIONS
-                else 0,
                 key="openai_quality",
+                format_func=lambda value: OPENAI_QUALITY_LABELS[value],
+                help="モデルを変えずに品質だけ下げた場合も比較できます。",
             )
             st.checkbox(
                 "16:9 にクロップ（YouTube向け）",
@@ -1425,10 +1469,16 @@ if generation_batches:
         provider_label = (
             "OpenAI" if selected_batch["provider"] == "openai" else "Gemini"
         )
-        st.caption(
-            f"生成モデル: {provider_label} ／ "
-            f"保存画像: {len(selected_batch['images'])}枚"
-        )
+        saved_model = selected_batch.get("model", "").strip()
+        generation_details = [
+            f"生成モデル: {model_label(saved_model) if saved_model else provider_label}"
+        ]
+        if selected_batch.get("quality"):
+            generation_details.append(f"品質: {selected_batch['quality']}")
+        if selected_batch.get("size"):
+            generation_details.append(f"サイズ: {selected_batch['size']}")
+        generation_details.append(f"保存画像: {len(selected_batch['images'])}枚")
+        st.caption(" ／ ".join(generation_details))
         st.markdown("**この回で使ったプロンプト**")
         st.code(
             selected_batch["prompt"],
@@ -1658,16 +1708,24 @@ if submit_button and prompt and not st.session_state.generating:
 
     thread = threading.Thread(
         target=generation_worker,
-        args=(
-            sid, provider, api_key, prompt, image_bytes_list, num_to_generate,
-            output_dir, timestamp, start_num,
-            st.session_state.openai_model,
-            st.session_state.openai_size,
-            st.session_state.openai_quality,
-            st.session_state.openai_crop_16_9,
-            st.session_state.concurrency,
-            gallery_retention_days,
-        ),
+        kwargs={
+            "session_id": sid,
+            "provider": provider,
+            "api_key": api_key,
+            "prompt": prompt,
+            "image_bytes_list": image_bytes_list,
+            "num_to_generate": num_to_generate,
+            "output_dir": output_dir,
+            "timestamp": timestamp,
+            "start_num": start_num,
+            "gemini_model": st.session_state.gemini_model,
+            "openai_model": st.session_state.openai_model,
+            "openai_size": st.session_state.openai_size,
+            "openai_quality": st.session_state.openai_quality,
+            "openai_crop_16_9": st.session_state.openai_crop_16_9,
+            "max_workers": st.session_state.concurrency,
+            "retention_days": gallery_retention_days,
+        },
         daemon=True,
     )
     thread.start()
