@@ -1569,16 +1569,6 @@ if st.session_state.past_prompts:
             st.button(btn_label, key=f"past_btn_{idx}", help=past_prompt, on_click=set_prompt, args=(past_prompt,), use_container_width=True)
 
 # 生成枚数の選択（on_clickコールバックで更新 → プロンプトが消えない）
-gallery_count = len(st.session_state.gallery_images)
-active_prompt = st.session_state.get("active_gallery_prompt", "").strip()
-draft_prompt = st.session_state.get("prompt_input", "").strip()
-starts_new_gallery = bool(
-    active_prompt and draft_prompt and draft_prompt != active_prompt
-)
-effective_gallery_count = 0 if starts_new_gallery else gallery_count
-remaining = MAX_GALLERY - effective_gallery_count
-is_max = remaining <= 0
-
 if st.session_state.pop("prompt_loaded_notice", False):
     st.success("✅ 選択したプロンプトを下の入力欄へ読み込みました。")
 
@@ -1598,18 +1588,10 @@ for i, count in enumerate([3, 5, 10, 20]):
 
 chosen_count = st.session_state.gen_count
 
-# ボタンラベル
-if starts_new_gallery:
-    btn_label = f"✨ 新しいプロンプトで新規ギャラリーを開始（{chosen_count}枚）"
-elif is_max:
-    btn_label = f"🚫 最大{MAX_GALLERY}枚に達しました（リセットしてください）"
-elif st.session_state.generating:
-    btn_label = "⏳ 生成中..."
-elif gallery_count == 0:
-    btn_label = f"✨ 画像を生成する（{chosen_count}枚）"
-else:
-    target = min(gallery_count + chosen_count, MAX_GALLERY)
-    btn_label = f"✨ さらに{chosen_count}枚追加生成する（現在 {gallery_count} 枚 → {target} 枚）"
+# form_submit_button は明示的な key を持てないため、フォーム内のプロンプトを
+# 送信した瞬間にラベルを変えると別ウィジェットとして再作成され、最初のクリックが
+# 失われる。プロンプト変更時も1回で生成へ進めるよう、送信前後でラベルを固定する。
+btn_label = f"✨ 画像を生成する（{chosen_count}枚）"
 
 # 入力フォーム
 with st.form(key="prompt_form"):
@@ -1624,6 +1606,11 @@ with st.form(key="prompt_form"):
         type="primary",
         disabled=st.session_state.generating,
     )
+
+st.caption(
+    "同じプロンプトなら現在のギャラリーへ追加し、プロンプトを変更した場合は"
+    "このボタン1回で新しいギャラリーを開始します。"
+)
 
 if submit_button and prompt and not st.session_state.generating:
     previous_active_prompt = st.session_state.get("active_gallery_prompt", "").strip()
